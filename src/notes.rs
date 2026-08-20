@@ -120,52 +120,6 @@ fn version_from_path(exe: &str) -> Option<String> {
     Some(name_version[idx + 1..].to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn nix_store_paths_yield_versions() {
-        assert_eq!(
-            version_from_path(
-                "/nix/store/pbsm8dv4d5nhdmdr494ibwsq393cvka2-kitty-0.48.2/bin/.kitty-wrapped"
-            )
-            .as_deref(),
-            Some("0.48.2")
-        );
-        // Multi-dash names: the version starts at the last dash-then-digit.
-        assert_eq!(
-            version_from_path(
-                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gnome-calculator-49.1/bin/x"
-            )
-            .as_deref(),
-            Some("49.1")
-        );
-        assert_eq!(version_from_path("/usr/bin/kitty"), None);
-        assert_eq!(
-            version_from_path("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-no-version/bin/x"),
-            None
-        );
-    }
-
-    #[test]
-    fn dates_render_from_unix_seconds() {
-        assert_eq!(iso_date(0), "1970-01-01");
-        assert_eq!(iso_date(1787213974), "2026-08-20");
-        assert_eq!(iso_date(951782400), "2000-02-29"); // leap day
-    }
-
-    #[test]
-    fn app_names_sanitise_to_safe_dirs() {
-        assert_eq!(sanitize("org.gnome.Nautilus"), "org.gnome.nautilus");
-        assert_eq!(
-            sanitize("io.github.berker_z.Marcel"),
-            "io.github.berker_z.marcel"
-        );
-        assert_eq!(sanitize("weird/../app name"), "weird_.._app_name");
-    }
-}
-
 /// The running window (if any) whose class matches `app`, case-insensitively.
 fn running_fingerprint(comp: &dyn Compositor, app: &str) -> Option<Fingerprint> {
     let windows = comp.windows().ok()?;
@@ -333,4 +287,50 @@ pub fn write(
             ""
         }
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nix_store_paths_yield_versions() {
+        assert_eq!(
+            version_from_path(
+                "/nix/store/pbsm8dv4d5nhdmdr494ibwsq393cvka2-kitty-0.48.2/bin/.kitty-wrapped"
+            )
+            .as_deref(),
+            Some("0.48.2")
+        );
+        // Multi-dash names: the version starts at the last dash-then-digit.
+        assert_eq!(
+            version_from_path(
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-gnome-calculator-49.1/bin/x"
+            )
+            .as_deref(),
+            Some("49.1")
+        );
+        assert_eq!(version_from_path("/usr/bin/kitty"), None);
+        assert_eq!(
+            version_from_path("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-no-version/bin/x"),
+            None
+        );
+    }
+
+    #[test]
+    fn dates_render_from_unix_seconds() {
+        assert_eq!(iso_date(0), "1970-01-01");
+        assert_eq!(iso_date(1787213974), "2026-08-20");
+        assert_eq!(iso_date(951782400), "2000-02-29"); // leap day
+    }
+
+    #[test]
+    fn app_names_sanitise_to_safe_dirs() {
+        assert_eq!(sanitize("org.gnome.Nautilus"), "org.gnome.nautilus");
+        assert_eq!(
+            sanitize("io.github.berker_z.Marcel"),
+            "io.github.berker_z.marcel"
+        );
+        assert_eq!(sanitize("weird/../app name"), "weird_.._app_name");
+    }
 }

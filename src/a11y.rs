@@ -673,49 +673,6 @@ impl A11y {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn element_ids_round_trip() {
-        // Flat GTK-style path.
-        let r = A11y::parse_element_id(":1.42|216").unwrap();
-        assert_eq!(r.0, ":1.42");
-        assert_eq!(r.1.as_str(), "/org/a11y/atspi/accessible/216");
-        assert_eq!(A11y::element_id(&r), ":1.42|216");
-
-        // Nested AccessKit-style path survives the trip too.
-        let r = A11y::parse_element_id(":1.39|0/88804201510221976").unwrap();
-        assert_eq!(
-            r.1.as_str(),
-            "/org/a11y/atspi/accessible/0/88804201510221976"
-        );
-        assert_eq!(A11y::element_id(&r), ":1.39|0/88804201510221976");
-
-        // App-custom absolute paths (GTK4 apps use their own prefix).
-        let r = A11y::parse_element_id(":1.0|/org/gnome/Nautilus/a11y/abc").unwrap();
-        assert_eq!(r.1.as_str(), "/org/gnome/Nautilus/a11y/abc");
-        assert_eq!(A11y::element_id(&r), ":1.0|/org/gnome/Nautilus/a11y/abc");
-    }
-
-    #[test]
-    fn malformed_element_ids_error() {
-        assert!(A11y::parse_element_id("no-separator").is_err());
-        assert!(A11y::parse_element_id(":1.2|with spaces").is_err());
-    }
-
-    #[test]
-    fn role_table_matches_atspi_enum() {
-        // Spot-check well-known values against the AT-SPI constants.
-        assert_eq!(ROLE_NAMES[23], "frame");
-        assert_eq!(ROLE_NAMES[43], "push button");
-        assert_eq!(ROLE_NAMES[61], "text");
-        assert_eq!(ROLE_NAMES[79], "entry");
-        assert_eq!(ROLE_NAMES[95], "document web");
-    }
-}
-
 /// Container roles that add nesting but no information; they are traversed
 /// but not printed unless they carry a name, an action, or text.
 fn is_boring(node: &Node) -> bool {
@@ -1181,4 +1138,47 @@ pub fn doctor_summary(comp: &dyn Compositor) -> String {
         );
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn element_ids_round_trip() {
+        // Flat GTK-style path.
+        let r = A11y::parse_element_id(":1.42|216").unwrap();
+        assert_eq!(r.0, ":1.42");
+        assert_eq!(r.1.as_str(), "/org/a11y/atspi/accessible/216");
+        assert_eq!(A11y::element_id(&r), ":1.42|216");
+
+        // Nested AccessKit-style path survives the trip too.
+        let r = A11y::parse_element_id(":1.39|0/88804201510221976").unwrap();
+        assert_eq!(
+            r.1.as_str(),
+            "/org/a11y/atspi/accessible/0/88804201510221976"
+        );
+        assert_eq!(A11y::element_id(&r), ":1.39|0/88804201510221976");
+
+        // App-custom absolute paths (GTK4 apps use their own prefix).
+        let r = A11y::parse_element_id(":1.0|/org/gnome/Nautilus/a11y/abc").unwrap();
+        assert_eq!(r.1.as_str(), "/org/gnome/Nautilus/a11y/abc");
+        assert_eq!(A11y::element_id(&r), ":1.0|/org/gnome/Nautilus/a11y/abc");
+    }
+
+    #[test]
+    fn malformed_element_ids_error() {
+        assert!(A11y::parse_element_id("no-separator").is_err());
+        assert!(A11y::parse_element_id(":1.2|with spaces").is_err());
+    }
+
+    #[test]
+    fn role_table_matches_atspi_enum() {
+        // Spot-check well-known values against the AT-SPI constants.
+        assert_eq!(ROLE_NAMES[23], "frame");
+        assert_eq!(ROLE_NAMES[43], "push button");
+        assert_eq!(ROLE_NAMES[61], "text");
+        assert_eq!(ROLE_NAMES[79], "entry");
+        assert_eq!(ROLE_NAMES[95], "document web");
+    }
 }
