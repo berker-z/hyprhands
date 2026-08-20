@@ -1,13 +1,16 @@
 //! The executor: `Action` in, `Observation` out.
 //!
-//! This is the seam. Any adapter — MCP today, a native computer-use loop
+//! Adapters stop here. Any of them — MCP today, a native computer-use loop
 //! later — should only ever construct `Action`s and call `execute`.
 
+use crate::a11y::{self, A11y};
 use crate::action::{Action, CaptureTarget, Error, Observation, Result};
 use crate::capture;
 use crate::compositor::{self, Compositor, WindowInfo};
 use crate::input;
+use crate::notes;
 use serde::Serialize;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// How long to wait for a requested focus change to land before refusing.
@@ -25,6 +28,9 @@ fn describe(w: &WindowInfo) -> String {
 
 pub struct Executor {
     comp: Box<dyn Compositor>,
+    /// Lazily connected: only sessions that use semantic tools pay for it, and
+    /// a failed connect is retried on the next call (the bus can come up later).
+    a11y: OnceLock<A11y>,
 }
 
 #[derive(Serialize)]
@@ -46,7 +52,16 @@ impl Executor {
     pub fn new() -> Result<Self> {
         Ok(Executor {
             comp: compositor::detect()?,
+            a11y: OnceLock::new(),
         })
+    }
+
+    fn a11y(&self) -> Result<&A11y> {
+        if let Some(a) = self.a11y.get() {
+            return Ok(a);
+        }
+        let conn = A11y::connect()?;
+        Ok(self.a11y.get_or_init(|| conn))
     }
 
     pub fn compositor(&self) -> &dyn Compositor {
@@ -125,11 +140,90 @@ impl Executor {
                     window.address, window.class, window.title
                 )))
             }
-            Action::Launch(command) => {
-                self.comp.launch(command)?;
+            Action::UiTree { window, depth, all } => {
+                a11y::ui_tree(self.a11y()?, self.comp.as_ref(), window, *depth, *all)
+                    .map(Observation::Text)
+            }
+            Action::FindElement {
+                query,
+                role,
+                window,
+            } => a11y::find_element(
+                self.a11y()?,
+                self.comp.as_ref(),
+                query,
+                role.as_deref(),
+                window,
+            )
+            .map(Observation::Text),
+            Action::ElementAction { element, action } => {
+                a11y::element_action(self.a11y()?, element, action.as_deref())
+                    .map(Observation::Text)
+            }
+            Action::ElementRead { element } => {
+                a11y::element_read(self.a11y()?, element).map(Observation::Text)
+            }
+            Action::ElementSetText { element, text } => {
+                a11y::element_set_text(self.a11y()?, element, text).map(Observation::Text)
+            }
+            Action::ElementFocus { element } => {
+                a11y::element_focus(self.a11y()?, element).map(Observation::Text)
+            }
+            Action::AppNotes { app } => notes::read(self.comp.as_ref(), app).map(Observation::Text),
+            Action::AppNotesWrite {
+                app,
+                content,
+                version,
+            } => notes::write(self.comp.as_ref(), app, content, version.as_deref())
+                .map(Observation::Text),
+            Action::Launch {
+                command,
+                wait_seconds,
+            } => {
+                let (wrapped, accessible) = a11y::accessible_command(command);
+                let wait = Duration::from_secs(u64::from(wait_seconds.unwrap_or(8)).min(30));
+                let started = std::time::Instant::now();
+                let opened = self.comp.launch_awaited(&wrapped, wait)?;
+                let a11y_note = if accessible {
+                    "\nAccessibility was enabled for it (Qt env + screen-reader \
+                     flag), so ui_tree may work on it."
+                } else {
+                    ""
+                };
+
+                let outcome = if opened.is_empty() {
+                    if wait.is_zero() {
+                        "Not waiting for a window. Call list_windows before \
+                         interacting with it."
+                            .to_string()
+                    } else {
+                        format!(
+                            "No window mapped within {:.1}s. The app may be slow, \
+                             windowless, or a single-instance app that deferred to \
+                             an existing process — check list_windows.",
+                            wait.as_secs_f32()
+                        )
+                    }
+                } else {
+                    let lines: Vec<String> = opened
+                        .iter()
+                        .map(|w| {
+                            format!(
+                                "  {} ({}) — \"{}\" on workspace {}",
+                                w.address, w.class, w.title, w.workspace
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "Mapped after {:.1}s:\n{}\nUse the address directly — no \
+                         need to call list_windows first.",
+                        started.elapsed().as_secs_f32(),
+                        lines.join("\n")
+                    )
+                };
+
                 Ok(Observation::text(format!(
-                    "launched: {command}\n\nThe window may take a moment to map. \
-                     Call list_windows to confirm before interacting with it."
+                    "launched: {command}\n\n{outcome}{a11y_note}"
                 )))
             }
         }
@@ -158,10 +252,10 @@ impl Executor {
 
         // Focus changes are applied asynchronously by the compositor.
         for _ in 0..FOCUS_POLL_ATTEMPTS {
-            if let Some(active) = self.comp.active_window()? {
-                if &active.address == address {
-                    return Ok(active);
-                }
+            if let Some(active) = self.comp.active_window()?
+                && &active.address == address
+            {
+                return Ok(active);
             }
             std::thread::sleep(FOCUS_POLL_INTERVAL);
         }

@@ -1,8 +1,9 @@
 //! MCP adapter: newline-delimited JSON-RPC 2.0 over stdio.
 //!
 //! Hand-rolled rather than pulled from an SDK — the surface we need is small
-//! and fully specified, and this keeps the dependency tree to three crates.
-//! Swapping in `rmcp` later touches only this file.
+//! and fully specified, and this keeps the dependency tree to four crates
+//! (serde, serde_json, base64, zbus). Swapping in `rmcp` later touches only
+//! this file.
 //!
 //! stdout is the protocol channel. Anything diagnostic MUST go to stderr or it
 //! corrupts the stream.
@@ -318,6 +319,200 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "ui_tree",
+            "description":
+                "Read a window's UI semantically via accessibility (AT-SPI): every \
+                 element's role, name, state, absolute centre coordinates, and \
+                 available actions, as an indented tree. STRONGLY PREFER this over \
+                 screenshots when it works — it is exact where pixel-guessing is \
+                 approximate, far cheaper in tokens, and its «id» tokens feed \
+                 element_action / element_set_text, which need no pointer at all. \
+                 Not every app exposes accessibility (doctor shows per-window \
+                 coverage); fall back to screenshot when this errors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": { "type": "string", "description": "Window address from list_windows. Defaults to the focused window." },
+                    "depth": { "type": "integer", "description": "Max tree depth to descend. Defaults to 12." },
+                    "all": { "type": "boolean", "description": "Include unnamed structural containers normally elided. Default false." }
+                }
+            },
+            "annotations": {
+                "title": "UI tree (semantic)",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "find_element",
+            "description":
+                "Search accessible UI elements by name substring and/or role \
+                 ('push button', 'text', 'menu item', ...). Searches one window, or \
+                 every accessible window when `window` is omitted. Returns matches \
+                 with absolute centre coordinates, states, actions, and «id» tokens \
+                 for the element_* tools. Cheaper and more precise than reading a \
+                 full ui_tree when you know what you are looking for.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Case-insensitive substring of the element's accessible name. Empty matches every element (filter by role)." },
+                    "role": { "type": "string", "description": "Exact role name, e.g. 'push button', 'text', 'check box'." },
+                    "window": { "type": "string", "description": "Restrict to this window address." }
+                },
+                "required": ["query"]
+            },
+            "annotations": {
+                "title": "Find UI element",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "element_action",
+            "description":
+                "Invoke an element's own action ('click', 'press', 'toggle', ...) by \
+                 «id» from ui_tree/find_element. This asks the app directly — no \
+                 pointer movement, no focus dance, no input tools needed, and it \
+                 works on off-screen elements. Prefer it over coordinate clicks \
+                 whenever the element exposes an action. Omit `action` to invoke \
+                 the element's primary (first) action.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "element": { "type": "string", "description": "Element «id» token." },
+                    "action": { "type": "string", "description": "Action name; defaults to the first listed." }
+                },
+                "required": ["element"]
+            },
+            "annotations": {
+                "title": "Invoke element action",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "element_read",
+            "description":
+                "Read an element's full text content or numeric value by «id». Use \
+                 for text fields, documents, sliders — exact text, no OCR-from-\
+                 screenshot guessing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "element": { "type": "string", "description": "Element «id» token." }
+                },
+                "required": ["element"]
+            },
+            "annotations": {
+                "title": "Read element",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "element_set_text",
+            "description":
+                "Replace an editable element's text contents in one call by «id» — \
+                 atomic and exact where type_text is keystroke-by-keystroke. Only \
+                 works on elements marked {set_text} in ui_tree. Verify with \
+                 element_read afterwards.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "element": { "type": "string", "description": "Element «id» token." },
+                    "text": { "type": "string" }
+                },
+                "required": ["element", "text"]
+            },
+            "annotations": {
+                "title": "Set element text",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": true,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "element_focus",
+            "description":
+                "Give an element keyboard focus by «id», e.g. a text field before \
+                 type_text or key.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "element": { "type": "string", "description": "Element «id» token." }
+                },
+                "required": ["element"]
+            },
+            "annotations": {
+                "title": "Focus element",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "app_notes",
+            "description":
+                "Read your saved notes about an application before driving it — \
+                 learned UI layout, quirks, workflows from past sessions. Notes are \
+                 version-stamped against the app's binary: the reply says CURRENT \
+                 (trust them), STALE (the app was updated since — treat as \
+                 hypotheses and verify), or UNVERIFIABLE. Call with no `app` to \
+                 list which apps have notes. Check this BEFORE exploring an app \
+                 from scratch.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string", "description": "App class as shown in list_windows, e.g. 'nautilus'. Omit to list all." }
+                }
+            },
+            "annotations": {
+                "title": "Read app notes",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "app_notes_write",
+            "description":
+                "Save (replace) your notes about an application for future \
+                 sessions: where key controls live, which workflows succeed, quirks \
+                 and gotchas. Write these AFTER successfully learning an app, and \
+                 REWRITE them when notes marked STALE turn out wrong. The server \
+                 stamps the running binary's identity so staleness is detected \
+                 automatically when the app updates; superseded notes are archived. \
+                 Content should be dense and factual — element names, menu paths, \
+                 sequences that worked.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": { "type": "string", "description": "App class as shown in list_windows." },
+                    "content": { "type": "string", "description": "Full replacement notes (markdown)." },
+                    "version": { "type": "string", "description": "Human-readable app version if you know it (e.g. from --version). Auto-detected from Nix store paths when omitted." }
+                },
+                "required": ["app", "content"]
+            },
+            "annotations": {
+                "title": "Write app notes",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "focus_window",
             "description": "Focus a window by the address reported by list_windows.",
             "inputSchema": {
@@ -336,11 +531,27 @@ fn tool_definitions() -> Value {
         {
             "name": "launch",
             "description":
-                "Launch an application. Returns immediately — the window takes a moment \
-                 to map, so confirm with list_windows before interacting with it.",
+                "Launch an application and wait for its window: the compositor's \
+                 event stream reports what mapped, so the result includes the new \
+                 window's address, class and title directly — no list_windows \
+                 polling needed. When the accessibility bus is up, the app is \
+                 started with accessibility enabled for GTK/Qt automatically; for \
+                 Electron/Chromium apps ALSO append --force-renderer-accessibility \
+                 to the command — that is what hydrates their full ui_tree. Prefer \
+                 relaunching an app accessibly over driving an inaccessible \
+                 instance by pixels.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "command": { "type": "string" } },
+                "properties": {
+                    "command": { "type": "string" },
+                    "wait_seconds": {
+                        "type": "integer",
+                        "description":
+                            "How long to wait for a window to map (default 8, max 30). \
+                             0 returns immediately. Timing out is not failure — \
+                             single-instance and windowless commands map nothing."
+                    }
+                },
                 "required": ["command"]
             },
             "annotations": {
@@ -428,9 +639,7 @@ fn parse_action(name: &str, args: &Value) -> Result<Action> {
                     h: need_i32(args, "height")?,
                 }),
                 other => {
-                    return Err(Error::new(format!(
-                        "unknown screenshot target {other:?}"
-                    )));
+                    return Err(Error::new(format!("unknown screenshot target {other:?}")));
                 }
             };
             Ok(Action::Screenshot {
@@ -456,9 +665,7 @@ fn parse_action(name: &str, args: &Value) -> Result<Action> {
                 }),
                 (None, None) => None,
                 _ => {
-                    return Err(Error::new(
-                        "click needs both x and y, or neither",
-                    ));
+                    return Err(Error::new("click needs both x and y, or neither"));
                 }
             };
             let button = match args.get("button").and_then(|b| b.as_str()) {
@@ -493,7 +700,46 @@ fn parse_action(name: &str, args: &Value) -> Result<Action> {
         }),
 
         "focus_window" => Ok(Action::FocusWindow(need_str(args, "address")?.to_string())),
-        "launch" => Ok(Action::Launch(need_str(args, "command")?.to_string())),
+        "launch" => Ok(Action::Launch {
+            command: need_str(args, "command")?.to_string(),
+            wait_seconds: args
+                .get("wait_seconds")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
+        }),
+
+        "ui_tree" => Ok(Action::UiTree {
+            window: opt_str(args, "window"),
+            depth: args.get("depth").and_then(|v| v.as_u64()).map(|d| d as u32),
+            all: args.get("all").and_then(|v| v.as_bool()).unwrap_or(false),
+        }),
+        "find_element" => Ok(Action::FindElement {
+            query: need_str(args, "query")?.to_string(),
+            role: opt_str(args, "role"),
+            window: opt_str(args, "window"),
+        }),
+        "element_action" => Ok(Action::ElementAction {
+            element: need_str(args, "element")?.to_string(),
+            action: opt_str(args, "action"),
+        }),
+        "element_read" => Ok(Action::ElementRead {
+            element: need_str(args, "element")?.to_string(),
+        }),
+        "element_set_text" => Ok(Action::ElementSetText {
+            element: need_str(args, "element")?.to_string(),
+            text: need_str(args, "text")?.to_string(),
+        }),
+        "element_focus" => Ok(Action::ElementFocus {
+            element: need_str(args, "element")?.to_string(),
+        }),
+        "app_notes" => Ok(Action::AppNotes {
+            app: opt_str(args, "app"),
+        }),
+        "app_notes_write" => Ok(Action::AppNotesWrite {
+            app: need_str(args, "app")?.to_string(),
+            content: need_str(args, "content")?.to_string(),
+            version: opt_str(args, "version"),
+        }),
 
         other => Err(Error::new(format!("unknown tool {other:?}"))),
     }

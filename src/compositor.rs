@@ -1,12 +1,14 @@
 //! Compositor abstraction.
 //!
-//! Hyprland is the only implementation today, but the trait is the seam that
-//! makes Sway/river support additive rather than invasive — they expose
-//! equivalent JSON IPC, so a second impl is mostly a different argv.
+//! Hyprland is the only implementation today, but the trait keeps Sway/river
+//! support additive rather than invasive — they expose equivalent JSON IPC,
+//! so a second impl is mostly a different argv.
 
 use crate::action::{Error, Point, Rect, Result};
 use crate::sh;
 use serde::Serialize;
+use std::io::Read as _;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct WindowInfo {
@@ -39,6 +41,15 @@ pub struct MonitorInfo {
     pub active_workspace: String,
 }
 
+/// A window the compositor reported as newly mapped after a launch.
+#[derive(Debug, Clone)]
+pub struct OpenedWindow {
+    pub address: String,
+    pub workspace: String,
+    pub class: String,
+    pub title: String,
+}
+
 pub trait Compositor {
     fn name(&self) -> &'static str;
     fn windows(&self) -> Result<Vec<WindowInfo>>;
@@ -53,6 +64,16 @@ pub trait Compositor {
     /// means "not supported, fall back to an input tool" — that is not an error.
     fn send_key(&self, _chord: &str) -> Result<bool> {
         Ok(false)
+    }
+
+    /// Launch a command and, where the compositor has an event stream, wait up
+    /// to `wait` for windows it maps — so callers get an address back instead
+    /// of sleeping and re-polling. An empty result after a successful launch
+    /// means "nothing mapped in time", not failure: single-instance apps defer
+    /// to an existing process, and slow apps map late.
+    fn launch_awaited(&self, command: &str, _wait: Duration) -> Result<Vec<OpenedWindow>> {
+        self.launch(command)?;
+        Ok(Vec::new())
     }
 
     /// Resolve a window by address, erroring with context if it's gone.
@@ -92,7 +113,11 @@ pub fn detect() -> Result<Box<dyn Compositor>> {
     Err(Error::with_hint(
         format!(
             "no supported compositor detected (XDG_CURRENT_DESKTOP={})",
-            if desktop.is_empty() { "unset" } else { &desktop }
+            if desktop.is_empty() {
+                "unset"
+            } else {
+                &desktop
+            }
         ),
         "hyprhands currently supports Hyprland. It must run inside the graphical \
          session so it inherits HYPRLAND_INSTANCE_SIGNATURE, WAYLAND_DISPLAY, \
@@ -112,6 +137,31 @@ impl Hyprland {
         let out = sh::run("hyprctl", &["-j", what])?;
         serde_json::from_str(&out)
             .map_err(|e| Error::new(format!("could not parse `hyprctl -j {what}` output: {e}")))
+    }
+
+    /// Does this Hyprland parse `dispatch` arguments as Lua?
+    ///
+    /// 0.56 replaced the space-separated dispatcher syntax (`movecursor X Y`)
+    /// with a Lua expression (`hl.dsp.cursor.move({x=X, y=Y})`); the old form
+    /// now fails with exit 7. Detected once per process and cached.
+    fn lua_dispatch(&self) -> bool {
+        static LUA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LUA.get_or_init(|| {
+            // Unknown version means newer-than-we-know, so assume Lua.
+            self.version()
+                .map(|(major, minor)| (major, minor) >= (0, 56))
+                .unwrap_or(true)
+        })
+    }
+
+    /// `(major, minor)` from `hyprctl -j version`, if it can be read.
+    fn version(&self) -> Option<(u32, u32)> {
+        let value = self.json("version").ok()?;
+        let version = value.get("version")?.as_str()?;
+        let mut parts = version.trim_start_matches('v').split(['.', '-']);
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        Some((major, minor))
     }
 
     fn dispatch(&self, args: &[&str]) -> Result<()> {
@@ -157,15 +207,8 @@ impl Hyprland {
                 w: size.first()?.as_i64()? as i32,
                 h: size.get(1)?.as_i64()? as i32,
             },
-            floating: v
-                .get("floating")
-                .and_then(|f| f.as_bool())
-                .unwrap_or(false),
-            fullscreen: v
-                .get("fullscreen")
-                .and_then(|f| f.as_i64())
-                .unwrap_or(0)
-                != 0,
+            floating: v.get("floating").and_then(|f| f.as_bool()).unwrap_or(false),
+            fullscreen: v.get("fullscreen").and_then(|f| f.as_i64()).unwrap_or(0) != 0,
             // Hyprland orders focus history; 0 is the focused window.
             focused: v
                 .get("focusHistoryID")
@@ -245,27 +288,147 @@ impl Compositor for Hyprland {
     }
 
     fn move_cursor(&self, to: Point) -> Result<()> {
+        if self.lua_dispatch() {
+            let arg = format!("hl.dsp.cursor.move({{x={}, y={}}})", to.x, to.y);
+            return self.dispatch(&[&arg]);
+        }
         let (x, y) = (to.x.to_string(), to.y.to_string());
         self.dispatch(&["movecursor", &x, &y])
     }
 
     fn focus_window(&self, address: &str) -> Result<()> {
+        if self.lua_dispatch() {
+            let arg = format!(
+                "hl.dsp.focus({{window=\"address:{}\"}})",
+                lua_escape(address)
+            );
+            return self.dispatch(&[&arg]);
+        }
         let target = format!("address:{address}");
         self.dispatch(&["focuswindow", &target])
     }
 
     fn launch(&self, command: &str) -> Result<()> {
+        if self.lua_dispatch() {
+            let arg = format!("hl.dsp.exec_cmd(\"{}\")", lua_escape(command));
+            return self.dispatch(&[&arg]);
+        }
         self.dispatch(&["exec", command])
     }
 
+    fn launch_awaited(&self, command: &str, wait: Duration) -> Result<Vec<OpenedWindow>> {
+        // Subscribe BEFORE dispatching, or a fast-mapping window races past us.
+        let stream = Hyprland::socket2_path().and_then(|p| {
+            let s = std::os::unix::net::UnixStream::connect(p).ok()?;
+            s.set_read_timeout(Some(Duration::from_millis(150))).ok()?;
+            Some(s)
+        });
+
+        self.launch(command)?;
+
+        let Some(mut stream) = stream else {
+            return Ok(Vec::new());
+        };
+
+        let mut opened: Vec<OpenedWindow> = Vec::new();
+        let mut pending = String::new();
+        let mut chunk = [0u8; 4096];
+        let hard_deadline = Instant::now() + wait;
+        // Once something maps, wait only briefly for siblings (splash + main
+        // window patterns), then return.
+        let mut quiet_deadline: Option<Instant> = None;
+
+        loop {
+            let now = Instant::now();
+            if now >= hard_deadline || quiet_deadline.is_some_and(|q| now >= q) {
+                break;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => break, // compositor closed the stream
+                Ok(n) => {
+                    pending.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                    while let Some(nl) = pending.find('\n') {
+                        let line: String = pending.drain(..=nl).collect();
+                        if let Some(w) = parse_openwindow(line.trim_end()) {
+                            opened.push(w);
+                            quiet_deadline = Some(Instant::now() + Duration::from_millis(400));
+                        }
+                    }
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(opened)
+    }
+
     fn send_key(&self, chord: &str) -> Result<bool> {
-        // `sendshortcut MOD,key,window` — needs no external input tool, which
-        // is why it is tried before wtype/ydotool.
+        // `sendshortcut` — needs no external input tool, which is why it is
+        // tried before wtype/ydotool.
         let (mods, key) = split_chord(chord)?;
-        let arg = format!("{},{},activewindow", mods.join(" "), key);
-        self.dispatch(&["sendshortcut", &arg])?;
+        if self.lua_dispatch() {
+            let arg = format!(
+                "hl.dsp.send_shortcut({{mods=\"{}\", key=\"{}\", window=\"activewindow\"}})",
+                lua_escape(&mods.join(" ")),
+                lua_escape(&key)
+            );
+            self.dispatch(&[&arg])?;
+        } else {
+            let arg = format!("{},{},activewindow", mods.join(" "), key);
+            self.dispatch(&["sendshortcut", &arg])?;
+        }
         Ok(true)
     }
+}
+
+impl Hyprland {
+    /// Hyprland's event stream lives next to the command socket.
+    fn socket2_path() -> Option<std::path::PathBuf> {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
+        let sig = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+        Some(
+            std::path::Path::new(&runtime)
+                .join("hypr")
+                .join(sig)
+                .join(".socket2.sock"),
+        )
+    }
+}
+
+/// `openwindow>>ADDR,WORKSPACE,CLASS,TITLE` — title may itself contain commas.
+///
+/// socket2 addresses lack the `0x` prefix that `hyprctl -j` uses everywhere
+/// else; it is added here so the result is directly usable as a window handle.
+fn parse_openwindow(line: &str) -> Option<OpenedWindow> {
+    let data = line.strip_prefix("openwindow>>")?;
+    let mut parts = data.splitn(4, ',');
+    let address = parts.next()?;
+    Some(OpenedWindow {
+        address: format!("0x{address}"),
+        workspace: parts.next()?.to_string(),
+        class: parts.next()?.to_string(),
+        title: parts.next().unwrap_or_default().to_string(),
+    })
+}
+
+/// Escape a string for interpolation into a double-quoted Lua literal.
+fn lua_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Split `ctrl+shift+t` into (`["CTRL", "SHIFT"]`, `"t"`).
@@ -297,4 +460,59 @@ pub fn split_chord(chord: &str) -> Result<(Vec<String>, String)> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok((normalised, (*key).to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chords_split_and_normalise() {
+        let (mods, key) = split_chord("ctrl+shift+t").unwrap();
+        assert_eq!(mods, vec!["CTRL", "SHIFT"]);
+        assert_eq!(key, "t");
+
+        let (mods, key) = split_chord("Super+Return").unwrap();
+        assert_eq!(mods, vec!["SUPER"]);
+        assert_eq!(key, "Return");
+
+        // A bare key has no modifiers; dashes work as separators too.
+        assert_eq!(split_chord("Escape").unwrap(), (vec![], "Escape".into()));
+        let (mods, _) = split_chord("ctrl-c").unwrap();
+        assert_eq!(mods, vec!["CTRL"]);
+    }
+
+    #[test]
+    fn chords_reject_junk() {
+        assert!(split_chord("").is_err());
+        assert!(split_chord("hyper+x").is_err());
+    }
+
+    #[test]
+    fn openwindow_lines_parse() {
+        let w = parse_openwindow("openwindow>>5d55e26dd860,2,org.gnome.Nautilus,Home").unwrap();
+        assert_eq!(w.address, "0x5d55e26dd860");
+        assert_eq!(w.workspace, "2");
+        assert_eq!(w.class, "org.gnome.Nautilus");
+        assert_eq!(w.title, "Home");
+    }
+
+    #[test]
+    fn openwindow_title_keeps_commas() {
+        let w = parse_openwindow("openwindow>>abc,1,kitty,fish, vim, and friends").unwrap();
+        assert_eq!(w.title, "fish, vim, and friends");
+    }
+
+    #[test]
+    fn other_events_ignored() {
+        assert!(parse_openwindow("activewindow>>kitty,fish").is_none());
+        assert!(parse_openwindow("closewindow>>abc").is_none());
+        assert!(parse_openwindow("").is_none());
+    }
+
+    #[test]
+    fn lua_escaping() {
+        assert_eq!(lua_escape(r#"say "hi"\now"#), r#"say \"hi\"\\now"#);
+        assert_eq!(lua_escape("a\nb"), "a\\nb");
+    }
 }

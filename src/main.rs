@@ -1,3 +1,4 @@
+mod a11y;
 mod action;
 mod capture;
 mod compositor;
@@ -5,6 +6,7 @@ mod doctor;
 mod exec;
 mod input;
 mod mcp;
+mod notes;
 mod sh;
 
 const USAGE: &str = "\

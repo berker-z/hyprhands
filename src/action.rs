@@ -121,6 +121,8 @@ pub enum CaptureTarget {
 /// notification, or the user alt-tabbing is enough to move it. Supplying
 /// `window` makes the executor focus and *verify* before acting, turning a
 /// silent wrong-window delivery into a refusal.
+// `ElementAction` deliberately echoes the enum name — it mirrors the MCP tool.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 pub enum Action {
     Screenshot {
@@ -155,7 +157,57 @@ pub enum Action {
         window: Option<String>,
     },
     FocusWindow(String),
-    Launch(String),
+    Launch {
+        command: String,
+        /// How long to await a mapped window on the compositor's event stream.
+        /// `Some(0)` returns immediately; `None` uses the default.
+        wait_seconds: Option<u32>,
+    },
+
+    // -- semantic (AT-SPI) verbs -------------------------------------------
+    /// Dump the accessibility tree of a window.
+    UiTree {
+        window: Option<String>,
+        depth: Option<u32>,
+        /// Include unnamed structural containers normally elided.
+        all: bool,
+    },
+    /// Search accessible elements by name substring and/or role.
+    FindElement {
+        query: String,
+        role: Option<String>,
+        window: Option<String>,
+    },
+    /// Invoke an element's own action ("click", "press", ...) — no pointer needed.
+    ElementAction {
+        element: String,
+        action: Option<String>,
+    },
+    /// Read an element's text or value.
+    ElementRead {
+        element: String,
+    },
+    /// Replace an editable element's text contents.
+    ElementSetText {
+        element: String,
+        text: String,
+    },
+    /// Give an element keyboard focus.
+    ElementFocus {
+        element: String,
+    },
+
+    // -- per-app memory ----------------------------------------------------
+    /// Read saved notes about an app (or list all apps with notes).
+    AppNotes {
+        app: Option<String>,
+    },
+    /// Save notes about an app; the server stamps binary identity.
+    AppNotesWrite {
+        app: String,
+        content: String,
+        version: Option<String>,
+    },
 }
 
 /// The result of executing an [`Action`].

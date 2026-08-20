@@ -45,7 +45,6 @@ const ENV_VARS: &[(&str, &str)] = &[
     ("XDG_RUNTIME_DIR", "required — where the sockets live"),
 ];
 
-
 /// Build the diagnostic report and a failure count.
 ///
 /// Split from [`run`] so the same text can be returned through the MCP
@@ -113,7 +112,11 @@ fn build() -> (String, u32) {
             let _ = writeln!(out, "  [ok]   detected {}", comp.name());
             match comp.windows() {
                 Ok(windows) => {
-                    let _ = writeln!(out, "  [ok]   IPC responding ({} windows open)", windows.len());
+                    let _ = writeln!(
+                        out,
+                        "  [ok]   IPC responding ({} windows open)",
+                        windows.len()
+                    );
                 }
                 Err(e) => {
                     failures += 1;
@@ -139,6 +142,16 @@ fn build() -> (String, u32) {
         Err(e) => {
             failures += 1;
             let _ = writeln!(out, "  [FAIL] {e}");
+        }
+    }
+
+    let _ = writeln!(out, "\naccessibility (semantic UI tools)");
+    match crate::compositor::detect() {
+        Ok(comp) => {
+            let _ = write!(out, "{}", crate::a11y::doctor_summary(comp.as_ref()));
+        }
+        Err(_) => {
+            let _ = writeln!(out, "  [--]   skipped (no compositor)");
         }
     }
 
