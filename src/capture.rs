@@ -145,10 +145,10 @@ fn ensure_visible(comp: &dyn Compositor, window: &WindowInfo) -> Result<()> {
             window.class, window.address, window.workspace
         ),
         format!(
-            "{}. Switch to it first via launch(\"hyprctl dispatch workspace {}\"), \
+            "{}. Bring it on screen first via focus_window(\"{}\"), \
              or capture a window that is currently on screen.",
             showing.join("; "),
-            window.workspace
+            window.address
         ),
     ))
 }

@@ -67,7 +67,9 @@ pub fn key(comp: &dyn Compositor, chord: &str) -> Result<()> {
     // than a silent no-op from the compositor.
     let (mods, key) = split_chord(chord)?;
 
-    if comp.send_key(chord)? {
+    // A failed compositor dispatch means "try the next backend", the same as
+    // Ok(false) — not a fatal error.
+    if comp.send_key(chord).unwrap_or(false) {
         return Ok(());
     }
 
@@ -75,14 +77,14 @@ pub fn key(comp: &dyn Compositor, chord: &str) -> Result<()> {
         let mut argv: Vec<String> = Vec::new();
         for m in &mods {
             argv.push("-M".to_string());
-            argv.push(m.to_ascii_lowercase());
+            argv.push(wtype_modifier(m));
         }
         argv.push("-k".to_string());
         argv.push(key.clone());
         // Release modifiers in reverse order.
         for m in mods.iter().rev() {
             argv.push("-m".to_string());
-            argv.push(m.to_ascii_lowercase());
+            argv.push(wtype_modifier(m));
         }
         let refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         return sh::run_ok("wtype", &refs);
@@ -92,6 +94,17 @@ pub fn key(comp: &dyn Compositor, chord: &str) -> Result<()> {
         &format!("send key chord {chord:?}"),
         TYPE_TOOLS,
     ))
+}
+
+/// wtype's name for a Hyprland-normalised modifier.
+///
+/// wtype accepts shift, capslock, ctrl, logo, win, alt, altgr — it spells
+/// "super" as "logo".
+fn wtype_modifier(m: &str) -> String {
+    match m {
+        "SUPER" => "logo".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
 }
 
 pub fn scroll(direction: ScrollDirection, amount: i32) -> Result<()> {

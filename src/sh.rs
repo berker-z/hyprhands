@@ -55,6 +55,10 @@ pub fn run_bytes(bin: &str, args: &[&str]) -> Result<Vec<u8>> {
 
     let output = Command::new(bin)
         .args(args)
+        // Some launchers leak an LD_LIBRARY_PATH pointing at their own bundled
+        // libraries, which breaks C++ children like hyprctl with GLIBCXX
+        // version errors. The system tools we spawn never need it.
+        .env_remove("LD_LIBRARY_PATH")
         .stdin(Stdio::null())
         .output()
         .map_err(|e| Error::new(format!("failed to spawn `{bin}`: {e}")))?;
@@ -62,7 +66,8 @@ pub fn run_bytes(bin: &str, args: &[&str]) -> Result<Vec<u8>> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let detail = if stderr.is_empty() {
-            format!("exit status {}", output.status)
+            // ExitStatus's Display already reads "exit status: N".
+            output.status.to_string()
         } else {
             stderr
         };
