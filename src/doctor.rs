@@ -4,35 +4,49 @@
 //! experience. This checks every binary and environment variable the executor
 //! depends on and prints exactly what's missing.
 
-use crate::input::{CLICK_TOOLS, SCROLL_TOOLS, TYPE_TOOLS};
+use crate::input::{CLICK_TOOLS, DRAG_TOOLS, SCROLL_TOOLS, TYPE_TOOLS};
 use crate::sh;
 
 struct Capability {
     name: &'static str,
     /// Any one of these satisfies it.
     any_of: &'static [&'static str],
+    /// Missing-but-optional reports as [--] and does not count as a failure.
+    /// For capabilities whose only backend is the last-resort ydotool tier,
+    /// which a normal Hyprland setup deliberately goes without.
+    optional: bool,
 }
 
 const CAPABILITIES: &[Capability] = &[
     Capability {
         name: "window state / focus / cursor / keys",
         any_of: &["hyprctl"],
+        optional: false,
     },
     Capability {
         name: "screenshot",
         any_of: &["grim"],
+        optional: false,
     },
     Capability {
         name: "click",
         any_of: CLICK_TOOLS,
+        optional: false,
     },
     Capability {
         name: "type text",
         any_of: TYPE_TOOLS,
+        optional: false,
     },
     Capability {
         name: "scroll",
         any_of: SCROLL_TOOLS,
+        optional: false,
+    },
+    Capability {
+        name: "drag (press-move-release)",
+        any_of: DRAG_TOOLS,
+        optional: true,
     },
 ];
 
@@ -93,6 +107,14 @@ fn build() -> (String, u32) {
         match cap.any_of.iter().find(|t| sh::have(t)) {
             Some(tool) => {
                 let _ = writeln!(out, "  [ok]   {:<38} via {tool}", cap.name);
+            }
+            None if cap.optional => {
+                let _ = writeln!(
+                    out,
+                    "  [--]   {:<38} needs one of: {} (optional)",
+                    cap.name,
+                    cap.any_of.join(", ")
+                );
             }
             None => {
                 failures += 1;

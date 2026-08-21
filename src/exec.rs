@@ -132,6 +132,85 @@ impl Executor {
                     describe(&focused)
                 )))
             }
+            Action::Drag {
+                from,
+                to,
+                button,
+                window,
+            } => {
+                let focused = self.ensure_focus(window)?;
+                input::drag(self.comp.as_ref(), *from, *to, *button)?;
+                Ok(Observation::text(format!(
+                    "{:?}-dragged from ({}, {}) to ({}, {}) — delivered to {}",
+                    button,
+                    from.x,
+                    from.y,
+                    to.x,
+                    to.y,
+                    describe(&focused)
+                )))
+            }
+            Action::MoveWindow { address, to } => {
+                self.comp.window_by_address(address)?;
+                self.comp.move_window(address, *to)?;
+                let after = self.comp.window_by_address(address)?;
+                let g = after.geometry;
+                if (g.x, g.y) == (to.x, to.y) {
+                    Ok(Observation::text(format!(
+                        "moved {} to ({}, {})",
+                        describe(&after),
+                        g.x,
+                        g.y
+                    )))
+                } else {
+                    // Hyprland answers "ok" and does nothing for tiled windows,
+                    // so requested-vs-actual is the only honest report.
+                    Ok(Observation::text(format!(
+                        "asked to move {} to ({}, {}) but it is at ({}, {}){}",
+                        describe(&after),
+                        to.x,
+                        to.y,
+                        g.x,
+                        g.y,
+                        if after.floating {
+                            ""
+                        } else {
+                            " — it is tiled, and the compositor only moves floating \
+                             windows freely. Float it first if you need exact placement."
+                        }
+                    )))
+                }
+            }
+            Action::ResizeWindow { address, w, h } => {
+                self.comp.window_by_address(address)?;
+                self.comp.resize_window(address, *w, *h)?;
+                let after = self.comp.window_by_address(address)?;
+                let g = after.geometry;
+                if (g.w, g.h) == (*w, *h) {
+                    Ok(Observation::text(format!(
+                        "resized {} to {}x{}",
+                        describe(&after),
+                        g.w,
+                        g.h
+                    )))
+                } else {
+                    Ok(Observation::text(format!(
+                        "asked to resize {} to {}x{} but it is {}x{}{}",
+                        describe(&after),
+                        w,
+                        h,
+                        g.w,
+                        g.h,
+                        if after.floating {
+                            ""
+                        } else {
+                            " — it is tiled, so the compositor adjusted the layout \
+                             split as far as the layout allows. Float it first if \
+                             you need an exact size."
+                        }
+                    )))
+                }
+            }
             Action::FocusWindow(address) => {
                 let window = self.comp.window_by_address(address)?;
                 self.comp.focus_window(address)?;
@@ -222,9 +301,14 @@ impl Executor {
                     )
                 };
 
-                Ok(Observation::text(format!(
-                    "launched: {command}\n\n{outcome}{a11y_note}"
-                )))
+                let mut apps: Vec<String> = opened.iter().map(|w| w.class.clone()).collect();
+                apps.sort_unstable();
+                apps.dedup();
+
+                Ok(Observation::text_for_apps(
+                    format!("launched: {command}\n\n{outcome}{a11y_note}"),
+                    apps,
+                ))
             }
         }
     }

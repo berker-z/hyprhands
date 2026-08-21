@@ -16,6 +16,7 @@ use crate::sh;
 pub const CLICK_TOOLS: &[&str] = &["wlrctl", "ydotool"];
 pub const TYPE_TOOLS: &[&str] = &["wtype", "ydotool"];
 pub const SCROLL_TOOLS: &[&str] = &["wlrctl", "ydotool"];
+pub const DRAG_TOOLS: &[&str] = &["ydotool"];
 
 fn none_available(what: &str, tools: &[&str]) -> Error {
     Error::with_hint(
@@ -105,6 +106,48 @@ fn wtype_modifier(m: &str) -> String {
         "SUPER" => "logo".to_string(),
         other => other.to_ascii_lowercase(),
     }
+}
+
+/// Press `button` at `from`, sweep the cursor to `to`, release.
+///
+/// This is the one capability that needs ydotool even on Hyprland: click is
+/// available everywhere, but neither `hyprctl dispatch` nor wlrctl exposes a
+/// *held* button, and a drag is press and release as two separate events with
+/// motion in between.
+pub fn drag(comp: &dyn Compositor, from: Point, to: Point, button: Button) -> Result<()> {
+    if !sh::have("ydotool") {
+        return Err(Error::with_hint(
+            "cannot drag: no input tool that can hold a button is installed",
+            "drag needs ydotool (press and release are separate events; wlrctl \
+             only exposes whole clicks). Install ydotool and run its daemon, or \
+             fall back to click / element_action for this interaction.",
+        ));
+    }
+
+    move_cursor(comp, from)?;
+    sh::run_ok("ydotool", &["click", button.ydotool_down_code()])?;
+
+    // Sweep in steps: many apps only start a drag after seeing motion events,
+    // and some drop it if the pointer teleports.
+    const STEPS: i32 = 8;
+    let sweep = || -> Result<()> {
+        for i in 1..=STEPS {
+            let p = Point {
+                x: from.x + (to.x - from.x) * i / STEPS,
+                y: from.y + (to.y - from.y) * i / STEPS,
+            };
+            move_cursor(comp, p)?;
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        Ok(())
+    };
+    let swept = sweep();
+
+    // The button is down; release it even if the sweep failed, or every
+    // subsequent pointer action happens with a phantom held button.
+    let released = sh::run_ok("ydotool", &["click", button.ydotool_up_code()]);
+    swept?;
+    released
 }
 
 pub fn scroll(direction: ScrollDirection, amount: i32) -> Result<()> {

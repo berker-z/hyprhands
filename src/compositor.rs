@@ -60,6 +60,18 @@ pub trait Compositor {
     fn focus_window(&self, address: &str) -> Result<()>;
     fn launch(&self, command: &str) -> Result<()>;
 
+    /// Ask the compositor to place a window's top-left at `to`. "Ok" from the
+    /// compositor does not mean it happened — Hyprland answers ok and does
+    /// nothing for tiled windows and for unknown addresses — so callers must
+    /// read the geometry back rather than trust the return value.
+    fn move_window(&self, address: &str, to: Point) -> Result<()>;
+
+    /// Ask the compositor to resize a window. Same caveat as [`move_window`]:
+    /// tiled windows get a layout-split adjustment at best, so read back.
+    ///
+    /// [`move_window`]: Compositor::move_window
+    fn resize_window(&self, address: &str, w: i32, h: i32) -> Result<()>;
+
     /// Send a key chord natively, if the compositor can. Returning `Ok(false)`
     /// means "not supported, fall back to an input tool" — that is not an error.
     fn send_key(&self, _chord: &str) -> Result<bool> {
@@ -314,6 +326,33 @@ impl Compositor for Hyprland {
             return self.dispatch(&[&arg]);
         }
         self.dispatch(&["exec", command])
+    }
+
+    fn move_window(&self, address: &str, to: Point) -> Result<()> {
+        if self.lua_dispatch() {
+            // relative=false is load-bearing: omitting it makes x/y an offset.
+            let arg = format!(
+                "hl.dsp.window.move({{x={}, y={}, relative=false, window=\"address:{}\"}})",
+                to.x,
+                to.y,
+                lua_escape(address)
+            );
+            return self.dispatch(&[&arg]);
+        }
+        let arg = format!("exact {} {},address:{address}", to.x, to.y);
+        self.dispatch(&["movewindowpixel", &arg])
+    }
+
+    fn resize_window(&self, address: &str, w: i32, h: i32) -> Result<()> {
+        if self.lua_dispatch() {
+            let arg = format!(
+                "hl.dsp.window.resize({{x={w}, y={h}, window=\"address:{}\"}})",
+                lua_escape(address)
+            );
+            return self.dispatch(&[&arg]);
+        }
+        let arg = format!("exact {w} {h},address:{address}");
+        self.dispatch(&["resizewindowpixel", &arg])
     }
 
     fn launch_awaited(&self, command: &str, wait: Duration) -> Result<Vec<OpenedWindow>> {

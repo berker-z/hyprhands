@@ -43,6 +43,24 @@ impl Button {
             Button::Middle => "0xC2",
         }
     }
+
+    /// ydotool press-only code (0x40 | button), for drag.
+    pub fn ydotool_down_code(self) -> &'static str {
+        match self {
+            Button::Left => "0x40",
+            Button::Right => "0x41",
+            Button::Middle => "0x42",
+        }
+    }
+
+    /// ydotool release-only code (0x80 | button), for drag.
+    pub fn ydotool_up_code(self) -> &'static str {
+        match self {
+            Button::Left => "0x80",
+            Button::Right => "0x81",
+            Button::Middle => "0x82",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +174,28 @@ pub enum Action {
         amount: i32,
         window: Option<String>,
     },
+    /// Press a button at `from`, move to `to`, release. Needs ydotool: the
+    /// compositor and wlrctl expose click but not separate press/release.
+    Drag {
+        from: Point,
+        to: Point,
+        button: Button,
+        window: Option<String>,
+    },
     FocusWindow(String),
+    /// Place a window's top-left corner at an absolute position. Tiled windows
+    /// ignore this; the observation reports where the window actually ended up.
+    MoveWindow {
+        address: String,
+        to: Point,
+    },
+    /// Resize a window. On tiled windows the compositor adjusts the layout
+    /// split as far as it can; the observation reports the resulting size.
+    ResizeWindow {
+        address: String,
+        w: i32,
+        h: i32,
+    },
     Launch {
         command: String,
         /// How long to await a mapped window on the compositor's event stream.
@@ -217,12 +256,29 @@ pub enum Action {
 #[derive(Debug)]
 pub enum Observation {
     Text(String),
-    Image { png: Vec<u8>, note: String },
+    /// Text tied to application classes discovered by the executor itself.
+    /// Adapters can use these authoritative hints for cross-cutting behavior
+    /// such as memory without scraping human-readable output.
+    TextForApps {
+        text: String,
+        apps: Vec<String>,
+    },
+    Image {
+        png: Vec<u8>,
+        note: String,
+    },
 }
 
 impl Observation {
     pub fn text(s: impl Into<String>) -> Self {
         Observation::Text(s.into())
+    }
+
+    pub fn text_for_apps(s: impl Into<String>, apps: Vec<String>) -> Self {
+        Observation::TextForApps {
+            text: s.into(),
+            apps,
+        }
     }
 }
 

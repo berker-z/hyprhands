@@ -12,14 +12,34 @@ use crate::action::{
     Action, Button, CaptureTarget, Error, Observation, Point, Rect, Result, ScrollDirection,
 };
 use crate::exec::Executor;
+use crate::notes;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 
 const SERVER_NAME: &str = "hyprhands";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FALLBACK_PROTOCOL: &str = "2025-06-18";
+
+const MEMORY_INSTRUCTIONS: &str = "hyprhands manages versioned per-application memory. Saved \
+    notes are injected automatically the first time an application is encountered in this \
+    server session; do not call app_notes proactively and do not rediscover facts already \
+    marked CURRENT. Use app_notes only to list memory or deliberately revisit notes after they \
+    have fallen out of context. During GUI work, collect \
+    only reusable, verified UI facts such as control names, menu paths, successful workflows, \
+    and stable quirks. A claim is verified only when supported by a returned tool result or by \
+    notes marked CURRENT; exclude plausible background knowledge that was not exercised. \
+    Do not save transient machine/session state such as dependency availability, bus failures, \
+    open documents, current media, geometry, focus, or capability errors unless verified as an \
+    app-specific stable quirk. Generalize placeholders and omit task-specific or acceptance-test \
+    values. After the \
+    workflow is verified and before completing the user's task, \
+    call app_notes_write with the full replacement notes if new reusable knowledge was learned \
+    or stale notes were corrected. Do not record user-entered content, secrets, document data, \
+    or guesses. A memory checkpoint in a tool result is an instruction to perform this review, \
+    not a request to interrupt an unfinished workflow.";
 
 const WINDOW_ARG: &str = "Address of the window to receive this input, from list_windows. \
      The server focuses it and confirms focus landed before acting, and errors out if it \
@@ -44,6 +64,7 @@ pub fn serve() -> i32 {
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
+    let mut memory = MemorySession::default();
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -77,7 +98,7 @@ pub fn serve() -> i32 {
             "initialize" => success(id, initialize(&params)),
             "ping" => success(id, json!({})),
             "tools/list" => success(id, json!({ "tools": tool_definitions() })),
-            "tools/call" => success(id, call_tool(&executor, &params)),
+            "tools/call" => success(id, call_tool(&executor, &mut memory, &params)),
             other => failure(id, -32601, &format!("method not found: {other}")),
         };
 
@@ -109,7 +130,8 @@ fn initialize(params: &Value) -> Value {
     json!({
         "protocolVersion": protocol,
         "capabilities": { "tools": {} },
-        "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION }
+        "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
+        "instructions": MEMORY_INSTRUCTIONS
     })
 }
 
@@ -319,6 +341,85 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "drag",
+            "description":
+                "Press a mouse button at one point, sweep the pointer to another, \
+                 release: drag-and-drop, sliders, text selection, rubber-band \
+                 selection. ALWAYS pass `window` — focus can change between turns \
+                 and the press must land on the window you looked at. Needs \
+                 ydotool (the only backend with separate press/release); doctor \
+                 shows whether it is available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "from_x": { "type": "integer" },
+                    "from_y": { "type": "integer" },
+                    "to_x": { "type": "integer" },
+                    "to_y": { "type": "integer" },
+                    "button": { "type": "string", "enum": ["left", "right", "middle"] },
+                    "window": { "type": "string", "description": WINDOW_ARG }
+                },
+                "required": ["from_x", "from_y", "to_x", "to_y"]
+            },
+            "annotations": {
+                "title": "Drag",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
+            "name": "move_window",
+            "description":
+                "Place a window's top-left corner at an absolute position. Only \
+                 floating windows move freely; a tiled window ignores this, and \
+                 the result reports where the window actually ended up either \
+                 way. Useful for arranging windows before multi-window work or \
+                 getting one out of the way of another.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Window address from list_windows." },
+                    "x": { "type": "integer" },
+                    "y": { "type": "integer" }
+                },
+                "required": ["address", "x", "y"]
+            },
+            "annotations": {
+                "title": "Move window",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "resize_window",
+            "description":
+                "Resize a window to an exact size. Floating windows resize \
+                 exactly; on a tiled window the compositor adjusts the layout \
+                 split as far as it can, and the result reports the actual \
+                 resulting size either way. Useful before screenshots of apps \
+                 that hide UI at small sizes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "address": { "type": "string", "description": "Window address from list_windows." },
+                    "width": { "type": "integer" },
+                    "height": { "type": "integer" }
+                },
+                "required": ["address", "width", "height"]
+            },
+            "annotations": {
+                "title": "Resize window",
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
             "name": "ui_tree",
             "description":
                 "Read a window's UI semantically via accessibility (AT-SPI): every \
@@ -463,13 +564,13 @@ fn tool_definitions() -> Value {
         {
             "name": "app_notes",
             "description":
-                "Read your saved notes about an application before driving it — \
-                 learned UI layout, quirks, workflows from past sessions. Notes are \
-                 version-stamped against the app's binary: the reply says CURRENT \
-                 (trust them), STALE (the app was updated since — treat as \
-                 hypotheses and verify), or UNVERIFIABLE. Call with no `app` to \
-                 list which apps have notes. Check this BEFORE exploring an app \
-                 from scratch.",
+                "Explicitly revisit saved application notes, or call with no `app` \
+                 to list every app with notes. Normal GUI work does not require a \
+                 manual read: hyprhands injects notes automatically on the first \
+                 encounter with each app in an MCP session. Do not call this \
+                 proactively. Notes are version-stamped \
+                 against the app binary: CURRENT means trust them, STALE means verify \
+                 them, and UNVERIFIABLE means the app is not running.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -489,8 +590,16 @@ fn tool_definitions() -> Value {
             "description":
                 "Save (replace) your notes about an application for future \
                  sessions: where key controls live, which workflows succeed, quirks \
-                 and gotchas. Write these AFTER successfully learning an app, and \
-                 REWRITE them when notes marked STALE turn out wrong. The server \
+                 and gotchas. A HYPRHANDS MEMORY CHECKPOINT in another tool result \
+                 requires you to consider this write after the workflow is verified \
+                 and before your final response. Write only when reusable facts were \
+                 learned; every claim must be backed by a returned tool result or \
+                 existing CURRENT notes. Exclude untested background knowledge, user \
+                 content, secrets, guesses, task-specific test values, and transient \
+                 environment/session state (dependency or bus availability, open content, \
+                 current media, focus, geometry, and capability failures). Generalize \
+                 examples with placeholders. REWRITE notes \
+                 when facts changed—the content is a full replacement. The server \
                  stamps the running binary's identity so staleness is detected \
                  automatically when the app updates; superseded notes are archived. \
                  Content should be dense and factual — element names, menu paths, \
@@ -565,12 +674,240 @@ fn tool_definitions() -> Value {
     ])
 }
 
-fn call_tool(executor: &Executor, params: &Value) -> Value {
+#[derive(Default)]
+struct MemorySession {
+    /// App classes whose saved notes have already been pushed into this MCP
+    /// session. This is deliberately session-local: a new agent session gets
+    /// a fresh injection without maintaining any hidden database state.
+    surfaced_apps: HashSet<String>,
+}
+
+struct MemoryDecoration {
+    before: Option<String>,
+    after: Option<String>,
+}
+
+impl MemorySession {
+    /// Full-replacement writes must not silently discard a record the model
+    /// has never seen. Return the existing memory and require a deliberate
+    /// retry after it has entered this session's context.
+    fn guard_write(&mut self, executor: &Executor, action: &Action) -> Option<Value> {
+        let Action::AppNotesWrite { app, .. } = action else {
+            return None;
+        };
+        let key = app.to_ascii_lowercase();
+        if self.surfaced_apps.contains(&key) || !notes::exists(app) {
+            return None;
+        }
+
+        self.surfaced_apps.insert(key);
+        let existing = notes::read(executor.compositor(), &Some(app.clone()))
+            .unwrap_or_else(|e| format!("The existing record could not be loaded safely: {e}"));
+        Some(json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "HYPRHANDS MEMORY MERGE REQUIRED — write not performed for {app}. \
+                     app_notes_write replaces the whole record, and this session had not \
+                     reviewed the existing notes. Merge any still-valid facts with your new, \
+                     verified knowledge, then call app_notes_write again with the complete \
+                     replacement.\n\n{existing}"
+                )
+            }],
+            "isError": true
+        }))
+    }
+
+    fn decorate(
+        &mut self,
+        executor: &Executor,
+        action: &Action,
+        app: Option<String>,
+    ) -> MemoryDecoration {
+        match action {
+            // Explicit reads already return the memory, so only suppress a
+            // duplicate automatic injection later in the same session.
+            Action::AppNotes { app: Some(app) } => {
+                self.surfaced_apps.insert(app.to_ascii_lowercase());
+                return MemoryDecoration {
+                    before: None,
+                    after: None,
+                };
+            }
+            // A successful write is itself the requested checkpoint.
+            Action::AppNotesWrite { app, .. } => {
+                self.surfaced_apps.insert(app.to_ascii_lowercase());
+                return MemoryDecoration {
+                    before: None,
+                    after: None,
+                };
+            }
+            Action::AppNotes { app: None } => {
+                return MemoryDecoration {
+                    before: None,
+                    after: None,
+                };
+            }
+            _ => {}
+        }
+
+        let Some(app) = app else {
+            return MemoryDecoration {
+                before: None,
+                after: None,
+            };
+        };
+
+        let key = app.to_ascii_lowercase();
+        let first_encounter = self.surfaced_apps.insert(key);
+        let before = first_encounter.then(|| {
+            let body =
+                notes::read(executor.compositor(), &Some(app.clone())).unwrap_or_else(|_| {
+                    format!(
+                        "No saved notes exist for {app}. Explore first; save only reusable, \
+                     verified UI knowledge if you learn any."
+                    )
+                });
+            format!("HYPRHANDS MEMORY — automatically loaded for {app}:\n{body}")
+        });
+
+        let after = is_memory_bearing(action).then(|| {
+            format!(
+                "HYPRHANDS MEMORY CHECKPOINT — {app}: continue the unfinished workflow. \
+                 Before your final response, call app_notes_write with full replacement notes \
+                 if you learned reusable, verified UI facts. Never save user content, secrets, \
+                 or guesses."
+            )
+        });
+
+        MemoryDecoration { before, after }
+    }
+}
+
+fn active_class(executor: &Executor) -> Option<String> {
+    executor
+        .compositor()
+        .active_window()
+        .ok()
+        .flatten()
+        .map(|w| w.class)
+}
+
+fn addressed_class(executor: &Executor, address: &str) -> Option<String> {
+    executor
+        .compositor()
+        .window_by_address(address)
+        .ok()
+        .map(|w| w.class)
+}
+
+/// Resolve the application an action is about to observe or affect. Doing this
+/// before execution is load-bearing for close actions: afterward the target
+/// window may already be gone and focus may have moved to an unrelated app.
+fn action_app_before(executor: &Executor, action: &Action) -> Option<String> {
+    match action {
+        Action::Launch { .. } => None,
+        // This observes every app at once. Associating it with whichever app
+        // happened to be focused injected unrelated memory into many tasks.
+        Action::ListWindows => None,
+        Action::Screenshot { target, .. } => match target {
+            CaptureTarget::ActiveWindow => active_class(executor),
+            CaptureTarget::Window(address) => addressed_class(executor, address),
+            CaptureTarget::All | CaptureTarget::Monitor(_) | CaptureTarget::Region(_) => None,
+        },
+        Action::Click { window, .. }
+        | Action::TypeText { window, .. }
+        | Action::Key { window, .. }
+        | Action::Scroll { window, .. }
+        | Action::Drag { window, .. }
+        | Action::UiTree { window, .. } => window
+            .as_deref()
+            .and_then(|address| addressed_class(executor, address))
+            .or_else(|| active_class(executor)),
+        Action::FindElement { window, .. } => window
+            .as_deref()
+            .and_then(|address| addressed_class(executor, address)),
+        Action::FocusWindow(address)
+        | Action::MoveWindow { address, .. }
+        | Action::ResizeWindow { address, .. } => addressed_class(executor, address),
+        // AT-SPI element ids do not carry a Hyprland address. Actions normally
+        // focus their owning app, so the active class is the safest association.
+        Action::ElementAction { .. }
+        | Action::ElementRead { .. }
+        | Action::ElementSetText { .. }
+        | Action::ElementFocus { .. } => active_class(executor),
+        Action::Doctor
+        | Action::CursorPosition
+        | Action::MoveCursor(_)
+        | Action::AppNotes { .. }
+        | Action::AppNotesWrite { .. } => None,
+    }
+}
+
+fn launched_app(observation: &Observation) -> Option<String> {
+    match observation {
+        Observation::TextForApps { apps, .. } => apps.first().cloned(),
+        _ => None,
+    }
+}
+
+fn is_memory_bearing(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Screenshot { .. }
+            | Action::Click { .. }
+            | Action::TypeText { .. }
+            | Action::Key { .. }
+            | Action::Scroll { .. }
+            | Action::Drag { .. }
+            | Action::Launch { .. }
+            | Action::UiTree { .. }
+            | Action::FindElement { .. }
+            | Action::ElementAction { .. }
+            | Action::ElementRead { .. }
+            | Action::ElementSetText { .. }
+            | Action::ElementFocus { .. }
+    )
+}
+
+fn call_tool(executor: &Executor, memory: &mut MemorySession, params: &Value) -> Value {
     let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    match parse_action(name, &args).and_then(|action| executor.execute(&action)) {
-        Ok(observation) => encode(observation),
+    let action = match parse_action(name, &args) {
+        Ok(action) => action,
+        Err(e) => {
+            return json!({
+                "content": [{ "type": "text", "text": e.to_string() }],
+                "isError": true
+            });
+        }
+    };
+
+    if let Some(response) = memory.guard_write(executor, &action) {
+        return response;
+    }
+
+    let app_before = action_app_before(executor, &action);
+    if let Some(app) = &app_before {
+        // Capture identity while the target still exists. A successful key or
+        // click can close the final window before the later memory write.
+        notes::observe_running(executor.compositor(), app);
+    }
+    match executor.execute(&action) {
+        Ok(observation) => {
+            let app = if matches!(action, Action::Launch { .. }) {
+                launched_app(&observation)
+            } else {
+                app_before
+            };
+            if let Some(app) = &app {
+                // Launches can only be attributed after their observation.
+                notes::observe_running(executor.compositor(), app);
+            }
+            let decoration = memory.decorate(executor, &action, app);
+            encode(observation, decoration)
+        }
         // Tool failures come back as content with isError, not as a JSON-RPC
         // error — the model needs to read the hint and route around it.
         Err(e) => json!({
@@ -580,20 +917,29 @@ fn call_tool(executor: &Executor, params: &Value) -> Value {
     }
 }
 
-fn encode(observation: Observation) -> Value {
-    match observation {
-        Observation::Text(text) => json!({
-            "content": [{ "type": "text", "text": text }],
-            "isError": false
-        }),
-        Observation::Image { png, note } => json!({
-            "content": [
-                { "type": "text", "text": note },
-                { "type": "image", "data": BASE64.encode(&png), "mimeType": "image/png" }
-            ],
-            "isError": false
-        }),
+fn encode(observation: Observation, memory: MemoryDecoration) -> Value {
+    let mut content = Vec::new();
+    if let Some(text) = memory.before {
+        content.push(json!({ "type": "text", "text": text }));
     }
+    match observation {
+        Observation::Text(text) => content.push(json!({ "type": "text", "text": text })),
+        Observation::TextForApps { text, .. } => {
+            content.push(json!({ "type": "text", "text": text }))
+        }
+        Observation::Image { png, note } => {
+            content.push(json!({ "type": "text", "text": note }));
+            content.push(json!({
+                "type": "image",
+                "data": BASE64.encode(&png),
+                "mimeType": "image/png"
+            }));
+        }
+    }
+    if let Some(text) = memory.after {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    json!({ "content": content, "isError": false })
 }
 
 // ---------------------------------------------------------------------------
@@ -699,6 +1045,39 @@ fn parse_action(name: &str, args: &Value) -> Result<Action> {
             window: opt_str(args, "window"),
         }),
 
+        "drag" => {
+            let button = match args.get("button").and_then(|b| b.as_str()) {
+                Some(b) => Button::parse(b)?,
+                None => Button::Left,
+            };
+            Ok(Action::Drag {
+                from: Point {
+                    x: need_i32(args, "from_x")?,
+                    y: need_i32(args, "from_y")?,
+                },
+                to: Point {
+                    x: need_i32(args, "to_x")?,
+                    y: need_i32(args, "to_y")?,
+                },
+                button,
+                window: opt_str(args, "window"),
+            })
+        }
+
+        "move_window" => Ok(Action::MoveWindow {
+            address: need_str(args, "address")?.to_string(),
+            to: Point {
+                x: need_i32(args, "x")?,
+                y: need_i32(args, "y")?,
+            },
+        }),
+
+        "resize_window" => Ok(Action::ResizeWindow {
+            address: need_str(args, "address")?.to_string(),
+            w: need_i32(args, "width")?,
+            h: need_i32(args, "height")?,
+        }),
+
         "focus_window" => Ok(Action::FocusWindow(need_str(args, "address")?.to_string())),
         "launch" => Ok(Action::Launch {
             command: need_str(args, "command")?.to_string(),
@@ -742,5 +1121,51 @@ fn parse_action(name: &str, args: &Value) -> Result<Action> {
         }),
 
         other => Err(Error::new(format!("unknown tool {other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_advertises_the_memory_lifecycle() {
+        let response = initialize(&json!({ "protocolVersion": "test-version" }));
+        assert_eq!(response["protocolVersion"], "test-version");
+        let instructions = response["instructions"].as_str().unwrap();
+        assert!(instructions.contains("injected automatically"));
+        assert!(instructions.contains("do not call app_notes proactively"));
+        assert!(instructions.contains("app_notes_write"));
+        assert!(instructions.contains("Do not record user-entered content"));
+    }
+
+    #[test]
+    fn memory_bearing_actions_are_limited_to_gui_learning() {
+        assert!(is_memory_bearing(&Action::Screenshot {
+            target: CaptureTarget::ActiveWindow,
+            scale: None,
+        }));
+        assert!(is_memory_bearing(&Action::Key {
+            chord: "ctrl+s".into(),
+            window: Some("0x1".into()),
+        }));
+        assert!(!is_memory_bearing(&Action::ListWindows));
+        assert!(!is_memory_bearing(&Action::AppNotes { app: None }));
+    }
+
+    #[test]
+    fn memory_wraps_an_observation_in_stable_order() {
+        let encoded = encode(
+            Observation::text("tool result"),
+            MemoryDecoration {
+                before: Some("saved context".into()),
+                after: Some("write checkpoint".into()),
+            },
+        );
+        let content = encoded["content"].as_array().unwrap();
+        assert_eq!(content[0]["text"], "saved context");
+        assert_eq!(content[1]["text"], "tool result");
+        assert_eq!(content[2]["text"], "write checkpoint");
+        assert_eq!(encoded["isError"], false);
     }
 }

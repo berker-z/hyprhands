@@ -22,10 +22,15 @@ WAYLAND_DISPLAY, HYPRLAND_INSTANCE_SIGNATURE, and XDG_RUNTIME_DIR.
 ";
 
 fn main() {
-    let arg = std::env::args().nth(1);
+    let mut args = std::env::args().skip(1);
+    let arg = args.next();
     let code = match arg.as_deref() {
         Some("mcp") => mcp::serve(),
         Some("doctor") => doctor::run(),
+        Some("__fingerprint") => match (args.next(), args.next()) {
+            (Some(pid), Some(output)) => notes::fingerprint_helper(&pid, &output),
+            _ => 2,
+        },
         Some("--version") | Some("-V") => {
             println!("hyprhands {}", env!("CARGO_PKG_VERSION"));
             0

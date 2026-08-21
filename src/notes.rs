@@ -19,7 +19,13 @@
 use crate::action::{Error, Result};
 use crate::compositor::Compositor;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct Fingerprint {
@@ -104,6 +110,66 @@ fn fingerprint_pid(pid: i64) -> Option<Fingerprint> {
     })
 }
 
+/// Shell-quote one argv fragment for Hyprland's `exec` command string.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Sandboxed harnesses commonly put the MCP server in a PID namespace: the
+/// compositor reports host PIDs, but `/proc/<pid>` is absent inside the
+/// server. Ask Hyprland to launch a tiny copy of this binary in the graphical
+/// session, where that host PID is visible, and exchange only the fingerprint
+/// through a private temporary directory.
+fn fingerprint_via_compositor(comp: &dyn Compositor, pid: i64) -> Option<Fingerprint> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "hyprhands-fingerprint-{}-{pid}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).ok()?;
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    let output = dir.join("result.json");
+    let result = (|| {
+        let helper = std::env::current_exe().ok()?;
+        let command = format!(
+            "{} __fingerprint {} {}",
+            shell_quote(&helper.to_string_lossy()),
+            pid,
+            shell_quote(&output.to_string_lossy())
+        );
+        comp.launch(&command).ok()?;
+
+        for _ in 0..50 {
+            if let Ok(raw) = std::fs::read_to_string(&output) {
+                return serde_json::from_str(&raw).ok();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    })();
+    let _ = std::fs::remove_file(&output);
+    let _ = std::fs::remove_dir(&dir);
+    result
+}
+
+/// Hidden helper entrypoint used by [`fingerprint_via_compositor`]. The output
+/// is create-new so even an unexpected path collision cannot overwrite data.
+pub fn fingerprint_helper(pid: &str, output: &str) -> i32 {
+    let Some(fingerprint) = pid.parse::<i64>().ok().and_then(fingerprint_pid) else {
+        return 1;
+    };
+    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(output) else {
+        return 1;
+    };
+    if serde_json::to_writer(&mut file, &fingerprint).is_err() || file.flush().is_err() {
+        return 1;
+    }
+    0
+}
+
 /// `/nix/store/<hash>-marcel-0.1.1/bin/marcel` → `0.1.1`.
 fn version_from_path(exe: &str) -> Option<String> {
     let store_dir = exe.strip_prefix("/nix/store/")?.split('/').next()?;
@@ -120,18 +186,92 @@ fn version_from_path(exe: &str) -> Option<String> {
     Some(name_version[idx + 1..].to_string())
 }
 
+enum RunningFingerprint {
+    NotRunning,
+    Unavailable,
+    Found(Fingerprint),
+}
+
+/// Binary identities observed while this server process was interacting with
+/// apps. Keeping this in memory lets a close-then-checkpoint workflow retain
+/// versioning without persisting machine state or trusting model-supplied data.
+fn observed_fingerprints() -> &'static Mutex<HashMap<String, Fingerprint>> {
+    static OBSERVED: OnceLock<Mutex<HashMap<String, Fingerprint>>> = OnceLock::new();
+    OBSERVED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// The running window (if any) whose class matches `app`, case-insensitively.
-fn running_fingerprint(comp: &dyn Compositor, app: &str) -> Option<Fingerprint> {
-    let windows = comp.windows().ok()?;
-    windows
-        .iter()
-        .find(|w| w.class.eq_ignore_ascii_case(app))
-        .and_then(|w| fingerprint_pid(w.pid))
+fn running_fingerprint(comp: &dyn Compositor, app: &str) -> RunningFingerprint {
+    let Ok(windows) = comp.windows() else {
+        return RunningFingerprint::Unavailable;
+    };
+    let Some(window) = windows.iter().find(|w| w.class.eq_ignore_ascii_case(app)) else {
+        return RunningFingerprint::NotRunning;
+    };
+    fingerprint_pid(window.pid)
+        .or_else(|| fingerprint_via_compositor(comp, window.pid))
+        .map(RunningFingerprint::Found)
+        .unwrap_or(RunningFingerprint::Unavailable)
+}
+
+/// Snapshot a live app identity before an interaction that may close it.
+pub fn observe_running(comp: &dyn Compositor, app: &str) {
+    if let RunningFingerprint::Found(fingerprint) = running_fingerprint(comp, app)
+        && let Ok(mut observed) = observed_fingerprints().lock()
+    {
+        observed.insert(app.to_ascii_lowercase(), fingerprint);
+    }
+}
+
+fn last_observed(app: &str) -> Option<Fingerprint> {
+    observed_fingerprints()
+        .lock()
+        .ok()
+        .and_then(|observed| observed.get(&app.to_ascii_lowercase()).cloned())
 }
 
 fn read_meta(dir: &std::path::Path) -> Option<Meta> {
     let raw = std::fs::read_to_string(dir.join("meta.json")).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// Whether an app already has a memory record. Used by adapters to prevent a
+/// blind full-replacement write before the existing record has been surfaced.
+pub fn exists(app: &str) -> bool {
+    notes_root().join(sanitize(app)).join("notes.md").is_file()
+}
+
+/// Reject unmistakably session-bound diagnostics before they become durable
+/// app knowledge. This intentionally targets narrow failure wording rather
+/// than broad terms such as "accessibility": stable app-specific setup and
+/// workarounds are useful memory, while the state of this machine's bus is not.
+fn validate_content(content: &str) -> Result<()> {
+    let lower = content.to_ascii_lowercase();
+    let transient_markers = [
+        "serviceunknown",
+        "no_at_bridge",
+        "bus unavailable",
+        "bus was unavailable",
+        "bus not available",
+        "bus is unavailable",
+        "no accessibility bus",
+        "not available in this environment",
+        "unavailable in this environment",
+        "as of last check",
+    ];
+
+    if let Some(marker) = transient_markers
+        .iter()
+        .find(|marker| lower.contains(**marker))
+    {
+        return Err(Error::with_hint(
+            format!("refusing to save transient session state in app memory (matched {marker:?})"),
+            "remove machine/session diagnostics such as current bus or dependency failures; \
+             keep only reusable app UI facts, stable app-specific quirks, and verified workflows",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Read notes for one app, or list all apps that have notes.
@@ -182,10 +322,10 @@ pub fn read(comp: &dyn Compositor, app: &Option<String>) -> Result<String> {
         &meta.as_ref().and_then(|m| m.fingerprint.clone()),
         running_fingerprint(comp, app),
     ) {
-        (Some(stored), Some(current)) if *stored == current => {
+        (Some(stored), RunningFingerprint::Found(current)) if *stored == current => {
             "CURRENT — the running binary is the one these notes were written against.".to_string()
         }
-        (Some(stored), Some(current)) => {
+        (Some(stored), RunningFingerprint::Found(current)) => {
             let old_v = meta.as_ref().and_then(|m| m.version.clone());
             let new_v = version_from_path(&current.exe);
             format!(
@@ -197,13 +337,19 @@ pub fn read(comp: &dyn Compositor, app: &Option<String>) -> Result<String> {
                 new_v.unwrap_or_else(|| current.exe.clone()),
             )
         }
-        (_, None) => format!(
+        (_, RunningFingerprint::NotRunning) => format!(
             "UNVERIFIABLE — {app} is not currently running, so the notes cannot \
              be checked against a live binary. Confirm the version once it is."
         ),
-        (None, Some(_)) => "UNVERIFIED — these notes were saved while the app was \
-             not running, so they carry no version identity."
-            .to_string(),
+        (_, RunningFingerprint::Unavailable) => format!(
+            "UNVERIFIABLE — {app} is running, but its executable identity could \
+             not be read. Treat the notes as hypotheses and verify against the live UI."
+        ),
+        (None, RunningFingerprint::Found(_)) => {
+            "UNVERIFIED — these notes were saved without a binary \
+             identity. Verify them, then rewrite while the app is running."
+                .to_string()
+        }
     };
 
     let header = meta
@@ -226,11 +372,19 @@ pub fn write(
     content: &str,
     version: Option<&str>,
 ) -> Result<String> {
+    // Validate before creating directories, archiving, or replacing anything.
+    validate_content(content)?;
+
     let dir = notes_root().join(sanitize(app));
     std::fs::create_dir_all(&dir)
         .map_err(|e| Error::new(format!("cannot create notes dir {}: {e}", dir.display())))?;
 
-    let current = running_fingerprint(comp, app);
+    let running = running_fingerprint(comp, app);
+    let live_current = match &running {
+        RunningFingerprint::Found(fingerprint) => Some(fingerprint.clone()),
+        RunningFingerprint::NotRunning | RunningFingerprint::Unavailable => None,
+    };
+    let current = live_current.clone().or_else(|| last_observed(app));
     let old_meta = read_meta(&dir);
 
     // Archive the outgoing notes when they belonged to a different binary.
@@ -270,16 +424,31 @@ pub fn write(
     )
     .map_err(|e| Error::new(format!("cannot write meta: {e}")))?;
 
+    let observed_suffix = if live_current.is_none() && current.is_some() {
+        " (last observed during this session)"
+    } else {
+        ""
+    };
     let identity = match (&current, &version) {
-        (Some(f), Some(v)) => format!("stamped against version {v} ({})", f.exe),
-        (Some(f), None) => format!("stamped against {}", f.exe),
-        (None, _) => format!(
-            "{app} is not running — notes saved without a version stamp; they \
-             will read back as UNVERIFIED until rewritten while the app runs"
-        ),
+        (Some(f), Some(v)) => {
+            format!("stamped against version {v} ({}){observed_suffix}", f.exe)
+        }
+        (Some(f), None) => format!("stamped against {}{observed_suffix}", f.exe),
+        (None, _) => match running {
+            RunningFingerprint::NotRunning => format!(
+                "{app} is not running — notes saved without a version stamp; they \
+                 will read back as UNVERIFIED until rewritten while the app runs"
+            ),
+            RunningFingerprint::Unavailable => format!(
+                "{app} is running, but its executable identity was unavailable — \
+                 notes saved without a version stamp"
+            ),
+            RunningFingerprint::Found(_) => unreachable!(),
+        },
     };
     Ok(format!(
-        "saved {} chars of notes for {app} — {identity}{}",
+        "saved {} chars of notes for {app} — {identity}{}\n\n\
+         HYPRHANDS MEMORY RECORD — {app}:\n{content}",
         content.chars().count(),
         if superseded {
             ". Previous version's notes archived to history/"
@@ -332,5 +501,41 @@ mod tests {
             "io.github.berker_z.marcel"
         );
         assert_eq!(sanitize("weird/../app name"), "weird_.._app_name");
+    }
+
+    #[test]
+    fn current_process_can_be_fingerprinted_directly() {
+        let fingerprint = fingerprint_pid(std::process::id().into()).unwrap();
+        assert!(!fingerprint.exe.is_empty());
+        assert!(fingerprint.size > 0);
+    }
+
+    #[test]
+    fn helper_commands_shell_quote_paths() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's here"), "'it'\\''s here'");
+    }
+
+    #[test]
+    fn transient_environment_failures_are_rejected_from_memory() {
+        for content in [
+            "AT-SPI bus was unavailable in this session",
+            "Verification methods (no accessibility bus)",
+            "ui_tree failed with ServiceUnknown",
+            "NO_AT_BRIDGE=1 was set",
+            "This was true as of last check",
+        ] {
+            let error = validate_content(content).unwrap_err();
+            assert!(error.message.contains("transient session state"));
+        }
+    }
+
+    #[test]
+    fn stable_app_specific_accessibility_workarounds_are_allowed() {
+        validate_content(
+            "Electron apps launched with --force-renderer-accessibility expose semantic controls.",
+        )
+        .unwrap();
+        validate_content("The Next control is immediately right of Play/Pause.").unwrap();
     }
 }
