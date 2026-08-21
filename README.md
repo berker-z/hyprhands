@@ -10,6 +10,10 @@ element's own actions without touching the pointer. Any MCP-capable harness
 works (Claude Code, Codex, Cursor) because the executor core knows nothing
 about models.
 
+It also keeps versioned memory per app. Agents can carry what they learned
+between sessions, while staleness checks flag notes that may no longer match
+the running version.
+
 No ydotool, no root, no portals. The core path drives Hyprland's own IPC, so
 window enumeration, focus, cursor movement, key chords, launching and
 screenshots need nothing installed beyond `hyprctl` and `grim`.
