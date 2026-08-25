@@ -367,6 +367,27 @@ a small `meta.json`. Greppable, editable, deletable by hand.
 
 ## Roadmap
 
+- [ ] Make background-safe automation the product default. Launch agent-owned
+      apps onto a silent hidden Hyprland workspace, keep later dialogs and
+      child windows there, and capture hidden/occluded windows through
+      `hyprland-toplevel-export-v1` instead of screen-region cropping. Expose
+      the delivery choice honestly: background actions must preserve the
+      user's active workspace, keyboard focus, and real cursor; actions with
+      no target-addressed route should refuse or require an explicit
+      foreground escalation rather than silently hijacking the seat.
+- [ ] Formalise the action ladder as CLI -> AT-SPI -> compositor-targeted
+      input -> real mouse/keyboard fallback. Prefer a verified command-line
+      operation first, then semantic accessibility actions and editable-text
+      writes, then Hyprland-addressed shortcuts (for example `sendshortcut`
+      to an exact window address). Pixel input through the user's real seat is
+      the last resort. Report which rung was used and whether its effect was
+      confirmed.
+- [ ] Investigate an optional isolated automation session for applications
+      that only accept raw pointer/keyboard events. A nested compositor owned
+      by hyprhands could provide a virtual output and per-surface input without
+      touching the user's cursor or focus. Keep this separate from the small
+      stock-Hyprland path and treat it as experimental until capture, Unicode
+      text, dialogs, drag/scroll, and process/window identity are verified.
 - [ ] Safe CLI discovery as part of per-app memory: when notes are empty or a
       binary/version change makes them stale, probe conventional help/version
       flags (`--help`, `-h`, and narrowly selected equivalents) before first
@@ -392,6 +413,18 @@ against Chromium and Obsidian; `move_window` and `resize_window` with
 read-back verification, checked end to end on floating and tiled windows.
 
 ## Acknowledgements
+
+The background-computer-use work in
+[`trycua/cua`](https://github.com/trycua/cua) is an important design reference
+for the roadmap above: in particular its background/foreground delivery
+contract, accessibility-first actions, compositor-owned isolation experiments,
+and explicit refusal of raw background input where stock Wayland cannot target
+it safely. The specific Hyprland lead inspected during planning was
+[`shuv1337/cua`](https://github.com/shuv1337/cua), whose author describes it as
+a "slop-fork of CUA"; it contains hidden `special:cua` workspace handling and
+`hyprland-toplevel-export-v1` capture work. If implementation is adapted, its
+exact upstream/fork commit provenance should be recorded alongside the code so
+credit goes to the actual author rather than being inferred from the fork.
 
 [`agent-sh/computer-use-linux`](https://github.com/agent-sh/computer-use-linux)
 solves a broader version of this problem (AT-SPI, GNOME Shell, portals and
