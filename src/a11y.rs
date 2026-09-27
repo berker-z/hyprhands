@@ -191,11 +191,14 @@ const ROLE_NAMES: &[&str] = &[
 /// past this budget the walk reports truncation instead of stalling the turn.
 const NODE_BUDGET: usize = 1500;
 const DEFAULT_DEPTH: u32 = 12;
+/// Hard ceiling on real tree depth, whatever is elided.
+const RAW_DEPTH_CAP: u32 = 64;
 
 const UNAVAILABLE_HINT: &str = "\
 The accessibility bus is how apps expose their UI semantically. To enable it: \
-NixOS: `services.gnome.at-spi2-core.enable = true` (and ensure NO_AT_BRIDGE \
-is not set to 1); other distros: install at-spi2-core. Per-toolkit: Qt apps \
+NixOS: `services.gnome.at-spi2-core.enable = true`, then rebuild and log in \
+again (while it is disabled NixOS exports NO_AT_BRIDGE=1 and GTK_A11Y=none, \
+which keep apps off the bus); other distros: install at-spi2-core. Per-toolkit: Qt apps \
 need QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1, Electron apps need \
 --force-renderer-accessibility, GTK apps join automatically. Apps only \
 register at startup, so restart them after enabling. Screenshot-based tools \
@@ -260,9 +263,31 @@ pub fn accessible_command(command: &str) -> (String, bool) {
     advertise_screen_reader();
     let escaped = command.replace('\'', "'\\''");
     (
-        format!("env -u NO_AT_BRIDGE QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 sh -c '{escaped}'"),
+        format!(
+            "env -u {} QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 sh -c '{escaped}'",
+            BRIDGE_BLOCKERS
+                .iter()
+                .map(|(var, _)| *var)
+                .collect::<Vec<_>>()
+                .join(" -u ")
+        ),
         true,
     )
+}
+
+/// Session variables that keep apps off the bus even when it is running.
+/// NixOS exports both whenever `services.gnome.at-spi2-core` is disabled,
+/// which is the default outside GNOME. `NO_AT_BRIDGE` stops GTK3 and
+/// Qt; GTK4 ignores it and reads `GTK_A11Y` instead.
+const BRIDGE_BLOCKERS: &[(&str, &str)] = &[("NO_AT_BRIDGE", "1"), ("GTK_A11Y", "none")];
+
+/// The blockers set in this process's environment, as `VAR=value`.
+fn blockers_in_env() -> Vec<String> {
+    BRIDGE_BLOCKERS
+        .iter()
+        .filter(|(var, bad)| std::env::var(var).is_ok_and(|v| v == *bad))
+        .map(|(var, bad)| format!("{var}={bad}"))
+        .collect()
 }
 
 /// `(bus name, object path)` — how AT-SPI references an accessible object.
@@ -552,6 +577,14 @@ impl A11y {
             })
     }
 
+    /// Is this window's process registered on the accessibility bus?
+    pub fn registered(&self, window: &WindowInfo) -> Result<bool> {
+        Ok(self
+            .applications()?
+            .iter()
+            .any(|(_, pid)| pid.map(|p| p as i64) == Some(window.pid)))
+    }
+
     /// The toplevel frame inside `app` that corresponds to `window`, plus the
     /// origin to subtract from window-relative extents (the frame's own
     /// reported origin, which absorbs CSD shadow offsets).
@@ -760,7 +793,11 @@ impl Walk<'_> {
             printed_depth + 1
         };
 
-        if depth >= self.max_depth {
+        // The limit counts levels that are shown. GTK4 wraps content in
+        // runs of unnamed containers (Nautilus nests eight before its file
+        // grid), and counting those spent the whole default budget on
+        // nothing visible. RAW_DEPTH_CAP still bounds the recursion.
+        if next_printed as u32 > self.max_depth || depth >= RAW_DEPTH_CAP {
             return;
         }
         if let Ok(children) = self.a11y.children(r) {
@@ -986,11 +1023,7 @@ pub fn element_action(a11y: &A11y, element: &str, action: Option<&str>) -> Resul
         &(index as i32,),
     )?;
     if ok {
-        Ok(format!(
-            "invoked {:?} on {element}. Verify the effect (screenshot or ui_tree) \
-             before assuming it worked.",
-            names[index]
-        ))
+        Ok(format!("invoked {:?} on {element}", names[index]))
     } else {
         Err(Error::new(format!(
             "app rejected action {:?} on {element}",
@@ -1025,7 +1058,9 @@ pub fn element_read(a11y: &A11y, element: &str) -> Result<String> {
     ))
 }
 
-pub fn element_set_text(a11y: &A11y, element: &str, text: &str) -> Result<String> {
+/// Replace an element's text, then read it back. Returns the report and
+/// whether the read-back matched: some apps accept the write and ignore it.
+pub fn element_set_text(a11y: &A11y, element: &str, text: &str) -> Result<(String, bool)> {
     let r = A11y::parse_element_id(element)?;
     let (ok,): (bool,) = a11y
         .call(
@@ -1043,11 +1078,32 @@ pub fn element_set_text(a11y: &A11y, element: &str, text: &str) -> Result<String
             )
         })?;
     if ok {
-        Ok(format!(
-            "replaced text contents of {element} with {} character(s). Verify with \
-             element_read — some apps report success without applying.",
-            text.chars().count()
-        ))
+        let count = a11y
+            .property_i32(&r, IFACE_TEXT, "CharacterCount")
+            .unwrap_or(-1);
+        let readback = a11y
+            .call::<(String,)>(&r.0, r.1.as_str(), IFACE_TEXT, "GetText", &(0i32, count))
+            .map(|t| t.0);
+        let chars = text.chars().count();
+        Ok(match readback {
+            Ok(now) if now == text => (
+                format!("replaced text contents of {element} with {chars} character(s)"),
+                true,
+            ),
+            Ok(now) => (
+                format!(
+                    "the app accepted the write to {element} but now reports {} \
+                     character(s) instead of the {chars} sent — it may have filtered, \
+                     formatted or ignored the text. element_read shows what is there.",
+                    now.chars().count()
+                ),
+                false,
+            ),
+            Err(_) => (
+                format!("replaced text contents of {element} with {chars} character(s)"),
+                false,
+            ),
+        })
     } else {
         Err(Error::with_hint(
             format!("app refused to set text on {element}"),
@@ -1088,8 +1144,15 @@ pub fn doctor_summary(comp: &dyn Compositor) -> String {
         Ok(a) => a,
         Err(e) => {
             let mut s = format!("  [--]   accessibility bus unavailable: {}\n", e.message);
-            if std::env::var("NO_AT_BRIDGE").is_ok_and(|v| v == "1") {
-                s.push_str("  [--]   NO_AT_BRIDGE=1 is set — apps will not register even if the bus comes up\n");
+            let blockers = blockers_in_env();
+            if !blockers.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "  [--]   {} exported — apps will not register even if the bus comes up.\n\
+                     \x20        On NixOS this means services.gnome.at-spi2-core is disabled; \
+                     enable it, rebuild, and log in again",
+                    blockers.join(" and ")
+                );
             }
             s.push_str("         semantic tools (ui_tree, find_element, element_*) are unavailable; screenshot flow still works\n");
             return s;
@@ -1143,6 +1206,21 @@ pub fn doctor_summary(comp: &dyn Compositor) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_unsets_every_bridge_blocker() {
+        // accessible_command only rewrites when the bus is up, so build the
+        // prefix the same way it does and check both variables are dropped.
+        let prefix = format!(
+            "env -u {}",
+            BRIDGE_BLOCKERS
+                .iter()
+                .map(|(var, _)| *var)
+                .collect::<Vec<_>>()
+                .join(" -u ")
+        );
+        assert_eq!(prefix, "env -u NO_AT_BRIDGE -u GTK_A11Y");
+    }
 
     #[test]
     fn element_ids_round_trip() {

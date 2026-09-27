@@ -214,6 +214,14 @@ fn running_fingerprint(comp: &dyn Compositor, app: &str) -> RunningFingerprint {
         .unwrap_or(RunningFingerprint::Unavailable)
 }
 
+/// Resolved executable path behind a window, when it can be read (directly,
+/// or through the compositor when the server sits in a PID namespace).
+pub fn executable(comp: &dyn Compositor, window: &crate::compositor::WindowInfo) -> Option<String> {
+    fingerprint_pid(window.pid)
+        .or_else(|| fingerprint_via_compositor(comp, window.pid))
+        .map(|f| f.exe)
+}
+
 /// Snapshot a live app identity before an interaction that may close it.
 pub fn observe_running(comp: &dyn Compositor, app: &str) {
     if let RunningFingerprint::Found(fingerprint) = running_fingerprint(comp, app)

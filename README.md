@@ -43,6 +43,8 @@ Early. v0.1, single developer, one machine.
 | `move_window`, `resize_window` | verified end to end, floating and tiled |
 | `drag` | implemented; needs ydotool, which this machine goes without, so unverified |
 | semantic tools (`ui_tree`, `element_*`) | verified against GTK4, Chromium, and AccessKit apps |
+| `key` addressed to a window | verified on a window on a hidden special workspace; focus and cursor unchanged |
+| `app_routes`, `cli_help`, `dbus_inspect`, `dbus_call` | verified against Spotify (MPRIS), Mousepad (`org.gtk.Actions`), git man pages |
 | `app_notes` versioning | verified, including staleness and history |
 | `launch` awaiting the window | verified |
 | multi-monitor, fractional scaling | untested |
@@ -67,6 +69,8 @@ backends   compositor.rs          hyprctl -j, socket2 events
            capture.rs             grim
            input.rs               wtype / wlrctl / ydotool
            a11y.rs                AT-SPI over D-Bus
+           ipc.rs                 app interfaces on the session bus
+           cli.rs                 isolated --help / man probes
            notes.rs               versioned per-app memory
 ```
 
@@ -206,7 +210,7 @@ trying to observe and act on.
 | `move_cursor` | absolute pointer move |
 | `click` | left/right/middle, optionally at a coordinate |
 | `type_text` | literal text into a window |
-| `key` | chords like `ctrl+shift+t`, `super+Return` |
+| `key` | chords like `ctrl+shift+t`, `super+Return`; with `window`, delivered without moving focus |
 | `scroll` | up/down/left/right |
 | `drag` | press, sweep, release: drag-and-drop, sliders, text selection. The one tool that needs ydotool |
 | `focus_window` | focus by address |
@@ -219,6 +223,10 @@ trying to observe and act on.
 | `element_read` | exact text or value of an element |
 | `element_set_text` | replace an editable element's contents in one call |
 | `element_focus` | give an element keyboard focus |
+| `app_routes` | which routes one app offers: CLI, D-Bus names, AT-SPI, keys, seat |
+| `cli_help` | a program's `--help`, `--version` or man page, isolated and cached |
+| `dbus_inspect` | bus names an app owns, and the methods and properties behind them |
+| `dbus_call` | call a method on the running app over D-Bus |
 | `app_notes` | read version-stamped notes about an app from past sessions |
 | `app_notes_write` | save what was learned about an app |
 
@@ -230,6 +238,13 @@ target, polls until the compositor confirms, and refuses to send input if
 focus never lands. Without it, input goes wherever focus happens to be. The
 result still reports which window received it, so a misdelivery is at least
 visible.
+
+`key` is the exception to the focus dance. With `window` set, Hyprland's
+`sendshortcut` delivers the chord to that window by address: it moves only
+the seat's keyboard focus to that surface for the length of the chord and
+puts it back. Your focused window, workspace and cursor stay where they were,
+and the target can be on another workspace or a hidden special one. If the
+compositor refuses, `key` falls back to focusing the window and says so.
 
 All actions take absolute layout coordinates, and screenshots report what you
 need to map back to them. Cropped captures report their absolute top-left
@@ -251,6 +266,77 @@ side. A timeout is reported as information, not an error, because
 single-instance apps defer to an existing process and windowless commands map
 nothing.
 
+## Routes
+
+There is usually more than one way to get an app to do something, and
+clicking pixels is the worst of them. It is slow, it costs screenshot tokens,
+and it takes the cursor away from whoever is sitting at the desk. So
+hyprhands treats every operation as a choice between routes, best first:
+
+1. **Headless CLI.** If the work does not depend on a live window
+   (converting a file, exporting, changing a setting, batch jobs), the app's
+   command-line interface is the cheapest route. The agent runs it from its
+   own shell; hyprhands does not grow a general exec tool. What it does
+   provide is `cli_help`, which reads a program's `--help`, `--version` or
+   man page. One trap: editing a file behind the back of a window that has it
+   open leaves that window stale.
+2. **App IPC.** D-Bus talks to the instance that is already running. Every
+   media player speaks MPRIS, GTK apps export `org.gtk.Actions` (the same
+   actions their menus fire), and plenty of apps publish their own
+   interface. `dbus_inspect` finds and reads them, `dbus_call` calls them.
+3. **Semantic.** AT-SPI, described in the next section.
+4. **Addressed keys.** `key` with a `window`, delivered by the compositor
+   without touching focus.
+5. **Seat input.** `click`, `type_text`, `scroll`, `drag`. These use your
+   real cursor and keyboard focus, so they come last.
+
+Everything above the last route leaves your focus and cursor alone. That is
+the property the ordering protects.
+
+The agent picks per operation, not per app: play/pause a Spotify track over
+MPRIS, then click through the UI for something MPRIS does not cover. For an
+app it has never seen, `app_routes` surveys what is available in one call:
+whether notes exist, which program on PATH is probably its CLI (from the
+running binary's name, then the window class), which bus names it owns
+(matched by the owning process's PID, or by the class appearing in the
+name), whether it is registered on the accessibility bus, and what the input
+routes would do. The server's MCP instructions describe the same ladder, and
+the automatic "no notes yet" message points at `app_routes`. Once a route
+works, the agent records it in the app's notes, so the next session starts
+on the right route instead of rediscovering it.
+
+Every acting tool ends its result with two lines saying which route carried
+it and whether the effect was confirmed:
+
+```
+route: addressed keys (compositor) — your focus and cursor untouched
+effect: unconfirmed — observe the result with ui_tree / element_read, or a screenshot when the app has no accessibility tree
+```
+
+Most effects are unconfirmed, because a delivered keystroke says nothing
+about what the app did with it. `element_set_text` is the one that checks
+itself: it reads the text back and reports `confirmed` only when it matches,
+since some apps accept the write and quietly ignore it.
+
+Running an arbitrary binary with `--help` is less innocent than it sounds.
+Single-instance GUI apps forward their arguments to the running instance
+over D-Bus, some ignore `--help` and open a window, and `shutdown -h` halts
+the machine. So `cli_help` runs its probes with `WAYLAND_DISPLAY`, `DISPLAY`,
+`HYPRLAND_INSTANCE_SIGNATURE` and `DBUS_SESSION_BUS_ADDRESS` removed, stdin
+closed, in an empty scratch directory and its own process group, with a 3
+second timeout and an output cap. It only tries `-h` when the program
+explicitly rejected `--help`. Results are cached under
+`$XDG_CACHE_HOME/hyprhands/cli/` keyed by the binary's resolved path, size
+and mtime, so a second session reads the cache and an update invalidates it.
+Long help is searchable with `filter`, which returns matching lines with a
+little context rather than the whole page.
+
+`dbus_call` takes arguments as JSON plus the D-Bus signature of the in-args
+(`dbus_inspect` prints it next to every method). Basic types, arrays, dicts,
+structs and variants convert; file descriptors do not. Calls that drive the
+running app are attributed to it through the bus name's owner PID, so its
+notes load and the memory checkpoint applies to IPC workflows too.
+
 ## Semantic UI (AT-SPI)
 
 Pixels are the fallback, not the plan. Where an app implements AT-SPI, the
@@ -271,7 +357,7 @@ title, and `doctor` shows exactly which open windows are accessible.
 
 Coverage is per-toolkit. `launch` does the enabling where it can: when the
 bus is up it wraps commands with the Qt/GTK environment
-(`QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, `NO_AT_BRIDGE` unset) and advertises
+(`QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, `NO_AT_BRIDGE` and `GTK_A11Y` unset) and advertises
 the screen-reader flag on `org.a11y.Status`, and the server registers AT-SPI
 event listeners so apps see a live assistive technology rather than a
 drive-by client.
@@ -288,10 +374,30 @@ drive-by client.
 
 Apps register only at startup, so restart an app after enabling any of this.
 
-The bus itself: most GNOME and KDE systems already run it. On NixOS set
-`services.gnome.at-spi2-core.enable = true` and make sure `NO_AT_BRIDGE=1` is
-not exported. Elsewhere install `at-spi2-core`. Without the bus the semantic
-tools return an error naming the fix, and the screenshot flow is unaffected.
+The bus itself: GNOME and KDE run it for you. A bare compositor like
+Hyprland usually does not, and on NixOS that goes further than a missing
+service. With `services.gnome.at-spi2-core` disabled, which is the default
+outside GNOME, the module exports `NO_AT_BRIDGE=1` and `GTK_A11Y=none` to the
+whole session so apps stop warning about the missing bus. Those two keep apps
+off the bus even if you start it by hand: GTK3 and Qt read the first, GTK4
+reads the second. The fix is one line in your system config:
+
+```nix
+services.gnome.at-spi2-core.enable = true;
+```
+
+Rebuild, then log out and back in, because session variables are only read
+at login. Apps register when they start, so restart anything that was
+already open. `doctor` reports either variable if it is still exported.
+
+It is cheap to put in a shared profile. The package is small, and on a
+headless host that has GTK anywhere in its closure it is already there.
+
+Elsewhere, install `at-spi2-core`. Without the bus the semantic tools return
+an error naming the fix, and the other routes are unaffected.
+
+`launch` unsets both variables for the app it starts, so on a session that
+has the bus running but still exports them, launched apps register anyway.
 
 ## Per-app memory
 
@@ -375,27 +481,20 @@ a small `meta.json`. Greppable, editable, deletable by hand.
       user's active workspace, keyboard focus, and real cursor; actions with
       no target-addressed route should refuse or require an explicit
       foreground escalation rather than silently hijacking the seat.
-- [ ] Formalise the action ladder as CLI -> AT-SPI -> compositor-targeted
-      input -> real mouse/keyboard fallback. Prefer a verified command-line
-      operation first, then semantic accessibility actions and editable-text
-      writes, then Hyprland-addressed shortcuts (for example `sendshortcut`
-      to an exact window address). Pixel input through the user's real seat is
-      the last resort. Report which rung was used and whether its effect was
-      confirmed.
+- [ ] Background text entry. Addressed keys cover shortcuts only;
+      `type_text` still goes through the seat. Per-character `sendshortcut`
+      works for keysyms on the current layout but not for arbitrary Unicode,
+      so it needs a layout-aware mapping (or a refusal) before it can be the
+      default for a window that is not focused.
+- [ ] Post-input feedback: after `key` or `type_text`, report which AT-SPI
+      element holds focus and whether it is editable, so a keystroke that
+      landed nowhere useful shows up as such.
 - [ ] Investigate an optional isolated automation session for applications
       that only accept raw pointer/keyboard events. A nested compositor owned
       by hyprhands could provide a virtual output and per-surface input without
       touching the user's cursor or focus. Keep this separate from the small
       stock-Hyprland path and treat it as experimental until capture, Unicode
       text, dialogs, drag/scroll, and process/window identity are verified.
-- [ ] Safe CLI discovery as part of per-app memory: when notes are empty or a
-      binary/version change makes them stale, probe conventional help/version
-      flags (`--help`, `-h`, and narrowly selected equivalents) before first
-      use and record verified reusable CLI capabilities alongside GUI facts.
-      Keep probes side-effect-free, bounded in time/output, tied to the
-      fingerprinted executable, and tolerant of programs whose "help" flags
-      launch a GUI or have surprising behavior; agents should then choose CLI
-      or GUI per operation rather than treating either as mandatory.
 - [ ] socket2 for input verification: let `key` and `click` optionally await
       a title or focus change as confirmation the action landed
 - [ ] Sway implementation behind the existing `Compositor` trait
@@ -410,7 +509,9 @@ Done so far: input verified against real `wtype` and `wlrctl`; the AT-SPI
 layer with compositor-anchored coordinates; versioned app notes; `launch`
 that awaits `openwindow` on socket2; accessibility-aware launching verified
 against Chromium and Obsidian; `move_window` and `resize_window` with
-read-back verification, checked end to end on floating and tiled windows.
+read-back verification, checked end to end on floating and tiled windows;
+the route ladder (CLI help discovery, D-Bus inspection and calls, addressed
+keys, and a route/effect line on every acting result).
 
 ## Acknowledgements
 
@@ -437,7 +538,10 @@ a downscaled preview back to desktop pixels; hyprhands does the same thing in
 prose in the accompanying text block, which is what makes automatic
 downscaling safe rather than a silent source of misclicks. And exposing
 `doctor` over MCP, not just as a CLI subcommand, lets the agent discover what
-it can do instead of finding out through a failed action.
+it can do instead of finding out through a failed action. `cli_help`'s probe
+runner follows their command runner's shape: every child in its own process
+group, a hard timeout, and capped output, so a misbehaving program cannot
+stall the server.
 
 One place we differ: for a window that is not currently rendered, they raise
 it and capture; hyprhands refuses and explains. Theirs is more useful, ours

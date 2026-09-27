@@ -167,6 +167,36 @@ fn build() -> (String, u32) {
         }
     }
 
+    // Nothing here counts as a failure: each route is optional, and the
+    // ladder falls through to the next one.
+    let _ = writeln!(out, "\nroutes (best first; app_routes surveys one app)");
+    let _ = writeln!(
+        out,
+        "  [ok]   headless CLI: cli_help reads --help{}",
+        if sh::have("man") {
+            " and man pages"
+        } else {
+            " (man not installed, so no man pages)"
+        }
+    );
+    match crate::ipc::session() {
+        Ok(_) => {
+            let _ = writeln!(out, "  [ok]   app IPC: session D-Bus reachable");
+        }
+        Err(e) => {
+            let _ = writeln!(out, "  [--]   app IPC: {}", e.message);
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  [..]   semantic: see the accessibility section below"
+    );
+    let _ = writeln!(
+        out,
+        "  [ok]   addressed keys: compositor delivers chords by window address"
+    );
+    let _ = writeln!(out, "  [..]   seat input: see capabilities above");
+
     let _ = writeln!(out, "\naccessibility (semantic UI tools)");
     match crate::compositor::detect() {
         Ok(comp) => {

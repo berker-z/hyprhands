@@ -1,10 +1,12 @@
 mod a11y;
 mod action;
 mod capture;
+mod cli;
 mod compositor;
 mod doctor;
 mod exec;
 mod input;
+mod ipc;
 mod mcp;
 mod notes;
 mod sh;

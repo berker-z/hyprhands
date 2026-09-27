@@ -78,6 +78,12 @@ pub trait Compositor {
         Ok(false)
     }
 
+    /// Deliver a key chord to one window by address without changing which
+    /// window has focus. `Ok(false)` means the compositor has no such route.
+    fn send_key_to(&self, _chord: &str, _address: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Launch a command and, where the compositor has an event stream, wait up
     /// to `wait` for windows it maps — so callers get an address back instead
     /// of sleeping and re-polling. An empty result after a successful launch
@@ -409,19 +415,34 @@ impl Compositor for Hyprland {
     fn send_key(&self, chord: &str) -> Result<bool> {
         // `sendshortcut` — needs no external input tool, which is why it is
         // tried before wtype/ydotool.
+        self.send_shortcut(chord, "activewindow")?;
+        Ok(true)
+    }
+
+    fn send_key_to(&self, chord: &str, address: &str) -> Result<bool> {
+        // With an explicit window, Hyprland moves only the *seat's* keyboard
+        // focus to that surface for the duration of the chord and restores
+        // it afterwards; the focused window, workspace and cursor stay put.
+        self.send_shortcut(chord, &format!("address:{address}"))?;
+        Ok(true)
+    }
+}
+
+impl Hyprland {
+    fn send_shortcut(&self, chord: &str, window: &str) -> Result<()> {
         let (mods, key) = split_chord(chord)?;
         if self.lua_dispatch() {
             let arg = format!(
-                "hl.dsp.send_shortcut({{mods=\"{}\", key=\"{}\", window=\"activewindow\"}})",
+                "hl.dsp.send_shortcut({{mods=\"{}\", key=\"{}\", window=\"{}\"}})",
                 lua_escape(&mods.join(" ")),
-                lua_escape(&key)
+                lua_escape(&key),
+                lua_escape(window)
             );
-            self.dispatch(&[&arg])?;
+            self.dispatch(&[&arg])
         } else {
-            let arg = format!("{},{},activewindow", mods.join(" "), key);
-            self.dispatch(&["sendshortcut", &arg])?;
+            let arg = format!("{},{},{window}", mods.join(" "), key);
+            self.dispatch(&["sendshortcut", &arg])
         }
-        Ok(true)
     }
 }
 

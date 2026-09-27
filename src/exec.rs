@@ -4,14 +4,27 @@
 //! later — should only ever construct `Action`s and call `execute`.
 
 use crate::a11y::{self, A11y};
-use crate::action::{Action, CaptureTarget, Error, Observation, Result};
+use crate::action::{Action, CaptureTarget, Effect, Error, Observation, Result, Route, route_line};
 use crate::capture;
+use crate::cli;
 use crate::compositor::{self, Compositor, WindowInfo};
 use crate::input;
+use crate::ipc;
 use crate::notes;
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 use std::time::Duration;
+
+/// How to check an effect that pointer or keyboard input cannot confirm.
+const OBSERVE_INPUT: &str = "observe the result with ui_tree / element_read, or a screenshot \
+     when the app has no accessibility tree";
+const OBSERVE_ELEMENT: &str = "read the element back with element_read, or re-run ui_tree";
+
+/// Append the route and effect lines to an acting tool's report.
+fn routed(text: impl Into<String>, route: Route, effect: Effect) -> Observation {
+    Observation::Text(format!("{}\n\n{}", text.into(), route_line(route, &effect)))
+}
 
 /// How long to wait for a requested focus change to land before refusing.
 const FOCUS_POLL_ATTEMPTS: u32 = 20;
@@ -26,11 +39,32 @@ fn describe(w: &WindowInfo) -> String {
     }
 }
 
+/// The program on PATH most likely to be this app's CLI.
+///
+/// Tries the running binary's own name first (Nix wrappers hide it as
+/// `.name-wrapped`), then the distinctive tail of the window class
+/// (`org.xfce.mousepad` → `mousepad`), then the whole class lowercased.
+fn cli_candidate(exe: Option<&str>, class: &str) -> Option<String> {
+    let from_exe = exe.and_then(|e| e.rsplit('/').next()).map(|base| {
+        base.trim_start_matches('.')
+            .trim_end_matches("-wrapped")
+            .to_string()
+    });
+    let tail = class.rsplit('.').next().map(|t| t.to_ascii_lowercase());
+    [from_exe, tail, Some(class.to_ascii_lowercase())]
+        .into_iter()
+        .flatten()
+        .filter(|c| !c.is_empty())
+        .find(|c| cli::resolve(c).is_ok())
+}
+
 pub struct Executor {
     comp: Box<dyn Compositor>,
     /// Lazily connected: only sessions that use semantic tools pay for it, and
     /// a failed connect is retried on the next call (the bus can come up later).
     a11y: OnceLock<A11y>,
+    /// Session bus for the app-IPC route; lazy for the same reasons.
+    session: OnceLock<zbus::blocking::Connection>,
 }
 
 #[derive(Serialize)]
@@ -53,6 +87,7 @@ impl Executor {
         Ok(Executor {
             comp: compositor::detect()?,
             a11y: OnceLock::new(),
+            session: OnceLock::new(),
         })
     }
 
@@ -62,6 +97,25 @@ impl Executor {
         }
         let conn = A11y::connect()?;
         Ok(self.a11y.get_or_init(|| conn))
+    }
+
+    fn session(&self) -> Result<&zbus::blocking::Connection> {
+        if let Some(c) = self.session.get() {
+            return Ok(c);
+        }
+        let conn = ipc::session()?;
+        Ok(self.session.get_or_init(|| conn))
+    }
+
+    /// The window class of the app that owns a bus name, if it has a window.
+    pub fn class_for_bus_name(&self, name: &str) -> Option<String> {
+        let pid = ipc::owner_pid(self.session().ok()?, name)?;
+        self.comp
+            .windows()
+            .ok()?
+            .into_iter()
+            .find(|w| w.pid == i64::from(pid))
+            .map(|w| w.class)
     }
 
     pub fn compositor(&self) -> &dyn Compositor {
@@ -97,29 +151,30 @@ impl Executor {
                         format!("at current cursor position ({}, {})", p.x, p.y)
                     }
                 };
-                Ok(Observation::text(format!(
-                    "{:?} click {where_} — delivered to {}",
-                    button,
-                    describe(&focused)
-                )))
+                Ok(routed(
+                    format!(
+                        "{:?} click {where_} — delivered to {}",
+                        button,
+                        describe(&focused)
+                    ),
+                    Route::Seat,
+                    Effect::Unconfirmed(OBSERVE_INPUT),
+                ))
             }
             Action::TypeText { text, window } => {
                 let focused = self.ensure_focus(window)?;
                 input::type_text(text)?;
-                Ok(Observation::text(format!(
-                    "typed {} character(s) — delivered to {}",
-                    text.chars().count(),
-                    describe(&focused)
-                )))
+                Ok(routed(
+                    format!(
+                        "typed {} character(s) — delivered to {}",
+                        text.chars().count(),
+                        describe(&focused)
+                    ),
+                    Route::Seat,
+                    Effect::Unconfirmed(OBSERVE_INPUT),
+                ))
             }
-            Action::Key { chord, window } => {
-                let focused = self.ensure_focus(window)?;
-                input::key(self.comp.as_ref(), chord)?;
-                Ok(Observation::text(format!(
-                    "sent key chord {chord} — delivered to {}",
-                    describe(&focused)
-                )))
-            }
+            Action::Key { chord, window } => self.key(chord, window),
             Action::Scroll {
                 direction,
                 amount,
@@ -127,10 +182,14 @@ impl Executor {
             } => {
                 let focused = self.ensure_focus(window)?;
                 input::scroll(*direction, *amount)?;
-                Ok(Observation::text(format!(
-                    "scrolled {direction:?} by {amount} — delivered to {}",
-                    describe(&focused)
-                )))
+                Ok(routed(
+                    format!(
+                        "scrolled {direction:?} by {amount} — delivered to {}",
+                        describe(&focused)
+                    ),
+                    Route::Seat,
+                    Effect::Unconfirmed(OBSERVE_INPUT),
+                ))
             }
             Action::Drag {
                 from,
@@ -140,15 +199,19 @@ impl Executor {
             } => {
                 let focused = self.ensure_focus(window)?;
                 input::drag(self.comp.as_ref(), *from, *to, *button)?;
-                Ok(Observation::text(format!(
-                    "{:?}-dragged from ({}, {}) to ({}, {}) — delivered to {}",
-                    button,
-                    from.x,
-                    from.y,
-                    to.x,
-                    to.y,
-                    describe(&focused)
-                )))
+                Ok(routed(
+                    format!(
+                        "{:?}-dragged from ({}, {}) to ({}, {}) — delivered to {}",
+                        button,
+                        from.x,
+                        from.y,
+                        to.x,
+                        to.y,
+                        describe(&focused)
+                    ),
+                    Route::Seat,
+                    Effect::Unconfirmed(OBSERVE_INPUT),
+                ))
             }
             Action::MoveWindow { address, to } => {
                 self.comp.window_by_address(address)?;
@@ -236,17 +299,78 @@ impl Executor {
             )
             .map(Observation::Text),
             Action::ElementAction { element, action } => {
-                a11y::element_action(self.a11y()?, element, action.as_deref())
-                    .map(Observation::Text)
+                let text = a11y::element_action(self.a11y()?, element, action.as_deref())?;
+                Ok(routed(
+                    text,
+                    Route::Semantic,
+                    Effect::Unconfirmed(OBSERVE_ELEMENT),
+                ))
             }
             Action::ElementRead { element } => {
                 a11y::element_read(self.a11y()?, element).map(Observation::Text)
             }
             Action::ElementSetText { element, text } => {
-                a11y::element_set_text(self.a11y()?, element, text).map(Observation::Text)
+                let (report, matched) = a11y::element_set_text(self.a11y()?, element, text)?;
+                let effect = if matched {
+                    Effect::Confirmed("the element's text reads back identical".into())
+                } else {
+                    Effect::Unconfirmed(OBSERVE_ELEMENT)
+                };
+                Ok(routed(report, Route::Semantic, effect))
             }
             Action::ElementFocus { element } => {
-                a11y::element_focus(self.a11y()?, element).map(Observation::Text)
+                let text = a11y::element_focus(self.a11y()?, element)?;
+                Ok(routed(
+                    text,
+                    Route::Semantic,
+                    Effect::Unconfirmed(OBSERVE_ELEMENT),
+                ))
+            }
+            Action::AppRoutes { window } => self.app_routes(window),
+            Action::CliHelp {
+                command,
+                subcommand,
+                source,
+                filter,
+            } => cli::help(command, subcommand.as_deref(), *source, filter.as_deref())
+                .map(Observation::Text),
+            Action::DbusInspect { window, name, path } => {
+                let conn = self.session()?;
+                match (name, window) {
+                    (Some(name), _) => ipc::inspect(conn, name, path.as_deref()),
+                    (None, Some(address)) => {
+                        let win = self.comp.window_by_address(address)?;
+                        self.describe_app_names(conn, &win)
+                    }
+                    (None, None) => ipc::list_all(conn, &self.comp.windows()?),
+                }
+                .map(Observation::Text)
+            }
+            Action::DbusCall {
+                name,
+                path,
+                interface,
+                method,
+                signature,
+                args,
+            } => {
+                let text = ipc::call(
+                    self.session()?,
+                    name,
+                    path,
+                    interface,
+                    method,
+                    signature.as_deref(),
+                    args,
+                )?;
+                Ok(routed(
+                    text,
+                    Route::AppIpc,
+                    Effect::Unconfirmed(
+                        "for a state change, read the property back with \
+                         org.freedesktop.DBus.Properties Get",
+                    ),
+                ))
             }
             Action::AppNotes { app } => notes::read(self.comp.as_ref(), app).map(Observation::Text),
             Action::AppNotesWrite {
@@ -311,6 +435,210 @@ impl Executor {
                 ))
             }
         }
+    }
+
+    /// A key chord, addressed to its window when one is named.
+    ///
+    /// With `window`, the compositor is asked to deliver the chord to that
+    /// window directly, which leaves the user's focus, workspace and cursor
+    /// alone and works on windows that are not on screen. Only when the
+    /// compositor has no such route does this fall back to focusing the
+    /// window and using the seat.
+    fn key(&self, chord: &str, window: &Option<String>) -> Result<Observation> {
+        // Validate first so a typo is a clear error, not a fallback.
+        compositor::split_chord(chord)?;
+
+        let mut fallback_reason = None;
+        if let Some(address) = window {
+            let target = self.comp.window_by_address(address)?;
+            match self.comp.send_key_to(chord, address) {
+                Ok(true) => {
+                    return Ok(routed(
+                        format!(
+                            "sent key chord {chord} to {} without moving focus",
+                            describe(&target)
+                        ),
+                        Route::Addressed,
+                        Effect::Unconfirmed(OBSERVE_INPUT),
+                    ));
+                }
+                Ok(false) => {}
+                Err(e) => fallback_reason = Some(e.message),
+            }
+        }
+
+        let focused = self.ensure_focus(window)?;
+        input::key(self.comp.as_ref(), chord)?;
+        let mut text = format!(
+            "sent key chord {chord} — delivered to {}",
+            describe(&focused)
+        );
+        if let Some(reason) = fallback_reason {
+            let _ = write!(
+                text,
+                "\n(addressed delivery failed, so the window was focused instead: {reason})"
+            );
+        }
+        Ok(routed(
+            text,
+            Route::Seat,
+            Effect::Unconfirmed(OBSERVE_INPUT),
+        ))
+    }
+
+    /// Bus names for one window's app, with what each one is.
+    fn describe_app_names(
+        &self,
+        conn: &zbus::blocking::Connection,
+        win: &WindowInfo,
+    ) -> Result<String> {
+        let names = ipc::names_for(conn, win)?;
+        if names.is_empty() {
+            return Ok(format!(
+                "{} owns no well-known name on the session bus, so there is no app-IPC \
+                 route. Call dbus_inspect with no arguments to list every name.",
+                describe(win)
+            ));
+        }
+        let mut out = format!("session-bus names for {}:\n", describe(win));
+        for n in &names {
+            let why = if n.by_pid {
+                "owned by this window's process"
+            } else {
+                "name matches the window class"
+            };
+            let _ = writeln!(out, "  {} ({why})", n.name);
+            if let Some(what) = ipc::describe_name(&n.name) {
+                let _ = writeln!(out, "    {what}");
+            }
+        }
+        out.push_str("\nPass `name` to dbus_inspect to list its objects and methods.");
+        Ok(out)
+    }
+
+    /// Survey the routes one app offers, best first.
+    fn app_routes(&self, window: &Option<String>) -> Result<Observation> {
+        let win = match window {
+            Some(address) => self.comp.window_by_address(address)?,
+            None => self.comp.active_window()?.ok_or_else(|| {
+                Error::with_hint(
+                    "no window is focused",
+                    "pass `window` with an address from list_windows",
+                )
+            })?,
+        };
+
+        let mut out = format!(
+            "routes for {} (pid {}), best first. Pick per operation: the highest \
+             route that can do the job. Notes that name a working route beat this \
+             survey.\n\n",
+            describe(&win),
+            win.pid
+        );
+
+        let _ = writeln!(
+            out,
+            "notes: {}",
+            if notes::exists(&win.class) {
+                "saved (injected automatically on first contact; app_notes rereads them)"
+            } else {
+                "none yet — record the routes that work with app_notes_write"
+            }
+        );
+
+        // 1. headless CLI
+        let exe = notes::executable(self.comp.as_ref(), &win);
+        match cli_candidate(exe.as_deref(), &win.class) {
+            Some(program) => {
+                let _ = writeln!(
+                    out,
+                    "\n1. headless CLI: `{program}` is on PATH{}. Read what it can do with \
+                     cli_help, then run it from your own shell. Right for work that does \
+                     not depend on this window's live state (converting, exporting, \
+                     settings, batch jobs). Changing a file this window has open, behind \
+                     its back, leaves the window stale.",
+                    exe.as_deref()
+                        .map(|e| format!(" (running binary: {e})"))
+                        .unwrap_or_default()
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "\n1. headless CLI: no program named after this app is on PATH{}. \
+                     cli_help takes any program name if you know a better one.",
+                    exe.as_deref()
+                        .map(|e| format!(" (running binary: {e})"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+
+        // 2. app IPC
+        let ipc_line = match self.session() {
+            Ok(conn) => match ipc::names_for(conn, &win) {
+                Ok(names) if names.is_empty() => {
+                    "no well-known session-bus name belongs to this app.".to_string()
+                }
+                Ok(names) => {
+                    let mut line = String::from(
+                        "the running instance is reachable over D-Bus without focus or \
+                         pixels. Names:",
+                    );
+                    for n in &names {
+                        let _ = write!(
+                            line,
+                            "\n     {}{}",
+                            n.name,
+                            if n.by_pid { "" } else { " (matched by name)" }
+                        );
+                        if let Some(what) = ipc::describe_name(&n.name) {
+                            let _ = write!(line, "\n       {what}");
+                        }
+                    }
+                    line.push_str("\n   dbus_inspect lists methods; dbus_call invokes them.");
+                    line
+                }
+                Err(e) => format!("could not list bus names: {}", e.message),
+            },
+            Err(e) => format!("session bus unreachable: {}", e.message),
+        };
+        let _ = writeln!(out, "\n2. app IPC: {ipc_line}");
+
+        // 3. semantic
+        let semantic = match self.a11y() {
+            Ok(a) => match a.registered(&win) {
+                Ok(true) => "registered. ui_tree / find_element read it; element_action \
+                             and element_set_text act on it without focus or cursor."
+                    .to_string(),
+                Ok(false) => "not registered. Apps register at startup, so relaunch it \
+                              with the launch tool (append --force-renderer-accessibility \
+                              for Electron/Chromium) if the semantic route matters."
+                    .to_string(),
+                Err(e) => format!("registry unreadable: {}", e.message),
+            },
+            Err(e) => format!("accessibility bus unavailable: {}", e.message),
+        };
+        let _ = writeln!(out, "\n3. semantic (AT-SPI): {semantic}");
+
+        // 4. addressed keys
+        let _ = writeln!(
+            out,
+            "\n4. addressed keys: key with window=\"{}\" is delivered to this window by the \
+             compositor without moving your focus or cursor, including when it is on \
+             another or a hidden workspace. Shortcuts only — no text, no pointer.",
+            win.address
+        );
+
+        // 5. seat
+        let _ = writeln!(
+            out,
+            "\n5. seat input: click, type_text, scroll and drag focus the window and use \
+             the real cursor and keyboard. Last resort: it interrupts whoever is at the \
+             desk, and a screenshot of the result needs the window on screen."
+        );
+
+        Ok(Observation::text_for_apps(out, vec![win.class]))
     }
 
     /// Resolve the window that input is about to be delivered to.

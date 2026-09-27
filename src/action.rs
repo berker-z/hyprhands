@@ -117,6 +117,54 @@ impl ScrollDirection {
     }
 }
 
+/// Which rung of the action ladder carried an action.
+///
+/// The ladder, best first: the headless CLI (run by the agent's own shell,
+/// so never reported here), app IPC, semantic accessibility, compositor-
+/// addressed keys, and finally the user's real seat. Everything above
+/// `Seat` leaves the user's focus and cursor alone; that is the property
+/// the ordering protects, and why every acting result names its route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// A method call on the running app over D-Bus.
+    AppIpc,
+    /// An AT-SPI action or text write on an element.
+    Semantic,
+    /// A key chord the compositor delivered to one window by address.
+    Addressed,
+    /// Pointer or keyboard input through the seat the user is also using.
+    Seat,
+}
+
+impl Route {
+    pub fn label(self) -> &'static str {
+        match self {
+            Route::AppIpc => "app IPC (D-Bus) — focus, cursor and pixels untouched",
+            Route::Semantic => "semantic (AT-SPI) — focus, cursor and pixels untouched",
+            Route::Addressed => "addressed keys (compositor) — your focus and cursor untouched",
+            Route::Seat => "seat input — used the real keyboard focus and/or cursor",
+        }
+    }
+}
+
+/// Whether the executor saw the action's effect, or only its delivery.
+#[derive(Debug, Clone)]
+pub enum Effect {
+    /// Read back and matched, with what was checked.
+    Confirmed(String),
+    /// Delivered, not observed. Carries how to check.
+    Unconfirmed(&'static str),
+}
+
+/// The closing line of every acting tool's result.
+pub fn route_line(route: Route, effect: &Effect) -> String {
+    let effect = match effect {
+        Effect::Confirmed(what) => format!("confirmed ({what})"),
+        Effect::Unconfirmed(how) => format!("unconfirmed — {how}"),
+    };
+    format!("route: {}\neffect: {effect}", route.label())
+}
+
 /// What a screenshot should cover.
 #[derive(Debug, Clone)]
 pub enum CaptureTarget {
@@ -234,6 +282,34 @@ pub enum Action {
     /// Give an element keyboard focus.
     ElementFocus {
         element: String,
+    },
+
+    // -- route discovery and app IPC ---------------------------------------
+    /// Survey which routes an app offers: notes, CLI, D-Bus, AT-SPI, input.
+    AppRoutes {
+        window: Option<String>,
+    },
+    /// Read a program's own documentation, isolated and cached.
+    CliHelp {
+        command: String,
+        subcommand: Option<String>,
+        source: crate::cli::HelpSource,
+        filter: Option<String>,
+    },
+    /// List session-bus names (all, or one window's), or describe one name.
+    DbusInspect {
+        window: Option<String>,
+        name: Option<String>,
+        path: Option<String>,
+    },
+    /// Call a method on a running app over the session bus.
+    DbusCall {
+        name: String,
+        path: String,
+        interface: String,
+        method: String,
+        signature: Option<String>,
+        args: Vec<serde_json::Value>,
     },
 
     // -- per-app memory ----------------------------------------------------

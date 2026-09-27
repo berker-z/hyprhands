@@ -11,6 +11,7 @@
 use crate::action::{
     Action, Button, CaptureTarget, Error, Observation, Point, Rect, Result, ScrollDirection,
 };
+use crate::cli::HelpSource;
 use crate::exec::Executor;
 use crate::notes;
 use base64::Engine as _;
@@ -23,12 +24,27 @@ const SERVER_NAME: &str = "hyprhands";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const FALLBACK_PROTOCOL: &str = "2025-06-18";
 
+const ROUTE_INSTRUCTIONS: &str = "hyprhands reaches an app by several routes. Pick one per \
+    operation, taking the highest that can do the job: (1) headless CLI — when the work does \
+    not depend on a live window (convert, export, settings, batch), run the app's command-line \
+    interface from your own shell; cli_help reads its --help or man page safely. Do not change \
+    files an open window holds without reloading them. (2) app IPC — dbus_call drives the \
+    running instance over D-Bus (MPRIS players, GTK actions, app interfaces); dbus_inspect \
+    finds them. (3) semantic — ui_tree / find_element, then element_action or \
+    element_set_text. (4) addressed keys — key with `window` reaches that window without \
+    moving the user's focus, even off screen. (5) seat input — click, type_text, scroll, drag \
+    take the real cursor and focus; last resort. Saved notes name routes that already worked; \
+    start there. With no notes for an app, call app_routes once to see which routes it offers. \
+    Observe the same way: element_read and ui_tree before screenshots. Acting results end with \
+    `route:` and `effect:` lines; an unconfirmed effect must be checked before you build on it.";
+
 const MEMORY_INSTRUCTIONS: &str = "hyprhands manages versioned per-application memory. Saved \
     notes are injected automatically the first time an application is encountered in this \
     server session; do not call app_notes proactively and do not rediscover facts already \
     marked CURRENT. Use app_notes only to list memory or deliberately revisit notes after they \
     have fallen out of context. During GUI work, collect \
     only reusable, verified UI facts such as control names, menu paths, successful workflows, \
+    the route each workflow used (CLI command, D-Bus method, element, shortcut), \
     and stable quirks. A claim is verified only when supported by a returned tool result or by \
     notes marked CURRENT; exclude plausible background knowledge that was not exercised. \
     Do not save transient machine/session state such as dependency availability, bus failures, \
@@ -131,7 +147,7 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": protocol,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": SERVER_NAME, "version": SERVER_VERSION },
-        "instructions": MEMORY_INSTRUCTIONS
+        "instructions": format!("{ROUTE_INSTRUCTIONS}\n\n{MEMORY_INSTRUCTIONS}")
     })
 }
 
@@ -295,15 +311,19 @@ fn tool_definitions() -> Value {
             "description":
                 "Send a key chord such as 'ctrl+c', 'super+Return', or 'Escape'. \
                  Modifiers: ctrl, shift, alt, super. The final key is an X11 keysym. \
-                 ALWAYS pass `window` — focus can change between turns (a permission prompt is \
-                 enough to steal it) and without it input goes to whatever happens to be \
-                 focused now, not what you last looked at. With `window` set, the server \
-                 focuses and verifies first, and refuses rather than misdeliver.",
+                 ALWAYS pass `window`: the compositor then delivers the chord to that \
+                 window by address, without moving the user's focus or cursor and even \
+                 when the window is on another or a hidden workspace. Only if that route \
+                 fails does the server focus the window (verified) and use the seat. \
+                 Without `window`, the chord goes to whatever is focused at that instant.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "chord": { "type": "string" },
-                    "window": { "type": "string", "description": WINDOW_ARG }
+                    "window": {
+                        "type": "string",
+                        "description": "Address of the window to receive the chord, from list_windows."
+                    }
                 },
                 "required": ["chord"]
             },
@@ -434,7 +454,7 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "window": { "type": "string", "description": "Window address from list_windows. Defaults to the focused window." },
-                    "depth": { "type": "integer", "description": "Max tree depth to descend. Defaults to 12." },
+                    "depth": { "type": "integer", "description": "Max depth of shown levels (elided unnamed containers do not count). Defaults to 12." },
                     "all": { "type": "boolean", "description": "Include unnamed structural containers normally elided. Default false." }
                 }
             },
@@ -562,6 +582,108 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "app_routes",
+            "description":
+                "Survey the routes one app offers, best first: whether notes exist, the \
+                 CLI program on PATH, D-Bus names it owns (MPRIS and others), whether it \
+                 is on the accessibility bus, and what addressed keys and seat input \
+                 would do. Call once for an app with no notes, before reaching for \
+                 screenshots and clicks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": { "type": "string", "description": "Window address from list_windows. Defaults to the focused window." }
+                }
+            },
+            "annotations": {
+                "title": "Survey app routes",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "cli_help",
+            "description":
+                "Read a program's own documentation: `--help` (default), `--version`, or \
+                 its man page. The probe cannot open windows or reach a running instance \
+                 (display and session-bus variables are removed), runs with a 3s \
+                 timeout, and is cached per binary version. Use `filter` to pull only \
+                 the lines about one topic from long help. This reads; it does not run \
+                 the program for real — do that from your own shell.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "Program name on PATH, or an absolute path. No arguments." },
+                    "subcommand": { "type": "string", "description": "One subcommand word, for git-style tools (e.g. 'export')." },
+                    "source": { "type": "string", "enum": ["help", "version", "man"], "description": "Defaults to help." },
+                    "filter": { "type": "string", "description": "Case-insensitive word; only matching lines (with context) come back." }
+                },
+                "required": ["command"]
+            },
+            "annotations": {
+                "title": "Read CLI help",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "dbus_inspect",
+            "description":
+                "Find and read app interfaces on the session D-Bus. With `window`: the \
+                 bus names that app owns. With `name`: every object under it that carries \
+                 interfaces. With `name` and `path`: that object's methods (with the \
+                 in-arg signature dbus_call needs), properties and signals. With \
+                 nothing: every well-known name on the bus.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "window": { "type": "string", "description": "Window address from list_windows." },
+                    "name": { "type": "string", "description": "Bus name, e.g. 'org.mpris.MediaPlayer2.spotify'." },
+                    "path": { "type": "string", "description": "Object path, e.g. '/org/mpris/MediaPlayer2'." }
+                }
+            },
+            "annotations": {
+                "title": "Inspect D-Bus",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            }
+        },
+        {
+            "name": "dbus_call",
+            "description":
+                "Call a method on a running app over the session D-Bus: play/pause a \
+                 player, trigger a GTK app action, read a property. Drives the live \
+                 instance with no focus, cursor or screenshots. Get the exact names and \
+                 the in-arg signature from dbus_inspect. Read a property with interface \
+                 'org.freedesktop.DBus.Properties', method 'Get', signature 'ss', args \
+                 [interface, property].",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Bus name." },
+                    "path": { "type": "string", "description": "Object path." },
+                    "interface": { "type": "string" },
+                    "method": { "type": "string" },
+                    "signature": { "type": "string", "description": "Concatenated D-Bus types of the in-args, e.g. 's', 'ss', 'sa{sv}'. Required when args is non-empty." },
+                    "args": { "type": "array", "description": "One JSON value per in-arg. Objects map to a{..}, lists to arrays/structs; variants infer their type." }
+                },
+                "required": ["name", "path", "interface", "method"]
+            },
+            "annotations": {
+                "title": "Call D-Bus method",
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+            }
+        },
+        {
             "name": "app_notes",
             "description":
                 "Explicitly revisit saved application notes, or call with no `app` \
@@ -603,7 +725,8 @@ fn tool_definitions() -> Value {
                  stamps the running binary's identity so staleness is detected \
                  automatically when the app updates; superseded notes are archived. \
                  Content should be dense and factual — element names, menu paths, \
-                 sequences that worked.",
+                 sequences that worked, and which route each used (CLI command, D-Bus \
+                 method, element action, shortcut) so the next session starts on it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -764,8 +887,9 @@ impl MemorySession {
             let body =
                 notes::read(executor.compositor(), &Some(app.clone())).unwrap_or_else(|_| {
                     format!(
-                        "No saved notes exist for {app}. Explore first; save only reusable, \
-                     verified UI knowledge if you learn any."
+                        "No saved notes exist for {app}. Call app_routes to see which routes \
+                     it offers before exploring by screenshot; save only reusable, verified \
+                     knowledge if you learn any."
                     )
                 });
             format!("HYPRHANDS MEMORY — automatically loaded for {app}:\n{body}")
@@ -824,9 +948,16 @@ fn action_app_before(executor: &Executor, action: &Action) -> Option<String> {
             .as_deref()
             .and_then(|address| addressed_class(executor, address))
             .or_else(|| active_class(executor)),
-        Action::FindElement { window, .. } => window
+        Action::AppRoutes { window } => window
+            .as_deref()
+            .and_then(|address| addressed_class(executor, address))
+            .or_else(|| active_class(executor)),
+        Action::FindElement { window, .. } | Action::DbusInspect { window, .. } => window
             .as_deref()
             .and_then(|address| addressed_class(executor, address)),
+        // Attribute IPC to the app that owns the name, so its notes load and
+        // the checkpoint asks for the route to be recorded.
+        Action::DbusCall { name, .. } => executor.class_for_bus_name(name),
         Action::FocusWindow(address)
         | Action::MoveWindow { address, .. }
         | Action::ResizeWindow { address, .. } => addressed_class(executor, address),
@@ -837,6 +968,7 @@ fn action_app_before(executor: &Executor, action: &Action) -> Option<String> {
         | Action::ElementSetText { .. }
         | Action::ElementFocus { .. } => active_class(executor),
         Action::Doctor
+        | Action::CliHelp { .. }
         | Action::CursorPosition
         | Action::MoveCursor(_)
         | Action::AppNotes { .. }
@@ -867,6 +999,7 @@ fn is_memory_bearing(action: &Action) -> bool {
             | Action::ElementRead { .. }
             | Action::ElementSetText { .. }
             | Action::ElementFocus { .. }
+            | Action::DbusCall { .. }
     )
 }
 
@@ -1111,6 +1244,39 @@ fn parse_action(name: &str, args: &Value) -> Result<Action> {
         "element_focus" => Ok(Action::ElementFocus {
             element: need_str(args, "element")?.to_string(),
         }),
+        "app_routes" => Ok(Action::AppRoutes {
+            window: opt_str(args, "window"),
+        }),
+        "cli_help" => Ok(Action::CliHelp {
+            command: need_str(args, "command")?.to_string(),
+            subcommand: opt_str(args, "subcommand"),
+            source: match opt_str(args, "source") {
+                Some(s) => HelpSource::parse(&s)?,
+                None => HelpSource::Help,
+            },
+            filter: opt_str(args, "filter"),
+        }),
+        "dbus_inspect" => Ok(Action::DbusInspect {
+            window: opt_str(args, "window"),
+            name: opt_str(args, "name"),
+            path: opt_str(args, "path"),
+        }),
+        "dbus_call" => Ok(Action::DbusCall {
+            name: need_str(args, "name")?.to_string(),
+            path: need_str(args, "path")?.to_string(),
+            interface: need_str(args, "interface")?.to_string(),
+            method: need_str(args, "method")?.to_string(),
+            signature: opt_str(args, "signature"),
+            args: match args.get("args") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(items)) => items.clone(),
+                Some(other) => {
+                    return Err(Error::new(format!(
+                        "`args` must be a list with one value per in-arg, got {other}"
+                    )));
+                }
+            },
+        }),
         "app_notes" => Ok(Action::AppNotes {
             app: opt_str(args, "app"),
         }),
@@ -1137,6 +1303,55 @@ mod tests {
         assert!(instructions.contains("do not call app_notes proactively"));
         assert!(instructions.contains("app_notes_write"));
         assert!(instructions.contains("Do not record user-entered content"));
+    }
+
+    #[test]
+    fn initialize_describes_the_route_ladder() {
+        let response = initialize(&json!({}));
+        let instructions = response["instructions"].as_str().unwrap();
+        for route in [
+            "headless CLI",
+            "app IPC",
+            "semantic",
+            "addressed keys",
+            "seat input",
+        ] {
+            assert!(instructions.contains(route), "missing {route}");
+        }
+        assert!(instructions.contains("app_routes"));
+    }
+
+    #[test]
+    fn route_tools_parse() {
+        let call = parse_action(
+            "dbus_call",
+            &json!({
+                "name": "org.mpris.MediaPlayer2.spotify",
+                "path": "/org/mpris/MediaPlayer2",
+                "interface": "org.mpris.MediaPlayer2.Player",
+                "method": "Seek",
+                "signature": "x",
+                "args": [1000000]
+            }),
+        )
+        .unwrap();
+        assert!(matches!(call, Action::DbusCall { ref args, .. } if args.len() == 1));
+        assert!(
+            parse_action(
+                "dbus_call",
+                &json!({ "name": "a", "path": "/", "interface": "i", "method": "m", "args": "x" })
+            )
+            .is_err()
+        );
+        assert!(matches!(
+            parse_action("cli_help", &json!({ "command": "git", "source": "man" })).unwrap(),
+            Action::CliHelp {
+                source: HelpSource::Man,
+                ..
+            }
+        ));
+        assert!(parse_action("cli_help", &json!({ "command": "git", "source": "info" })).is_err());
+        assert!(is_memory_bearing(&call));
     }
 
     #[test]
